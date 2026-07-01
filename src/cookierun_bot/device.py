@@ -148,12 +148,38 @@ class NetworkDevice:
         self._timeout = timeout
         self._sock = None
         self._guest_size: tuple[int, int] | None = None
+        # capture size (W,H) and display rotation, from INFO; drives the tap transform.
+        self._cap = (0, 0)
+        self._rot = 0
 
     def start(self) -> None:
         import socket
         s = socket.create_connection((self._host, self._port), timeout=self._timeout)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock = s
+        self._calibrate_transform()
+
+    def _calibrate_transform(self) -> None:
+        """AccessibilityService gestures use the display's NATURAL-orientation coordinate
+        space, but MediaProjection captures in the current rotation. Read capture size +
+        rotation from INFO and map captured (x,y) -> natural-orientation gesture coords."""
+        import re
+        info = self.info()
+        cap = re.search(r"capture=(\d+)x(\d+)", info)
+        rot = re.search(r"rot=(\d+)", info)
+        if cap:
+            self._cap = (int(cap.group(1)), int(cap.group(2)))  # (width, height)
+        if rot:
+            self._rot = int(rot.group(1))
+
+    def _to_gesture(self, x, y) -> tuple[int, int]:
+        cw, ch = self._cap
+        r = self._rot
+        if r == 1:      # ROTATION_90 (landscape): gx = ch - cy, gy = cx
+            return int(round(ch - y)), int(round(x))
+        if r == 3:      # ROTATION_270 (landscape, other way): gx = cy, gy = cw - cx
+            return int(round(y)), int(round(cw - x))
+        return int(round(x)), int(round(y))   # ROTATION_0 (portrait): identity
 
     def stop(self) -> None:
         try:
@@ -198,13 +224,30 @@ class NetworkDevice:
     def resolution(self) -> tuple[int, int]:
         return self._guest_size or (0, 0)
 
-    def tap(self, x: int, y: int) -> None:
-        self._sock.sendall(f"TAP {int(x)} {int(y)}\n".encode())
-        self._read_line()
+    def tap(self, x: int, y: int):
+        gx, gy = self._to_gesture(x, y)
+        self._sock.sendall(f"TAP {gx} {gy}\n".encode())
+        return self._read_line().decode(errors="replace").strip()
 
-    def hold(self, x: int, y: int, duration_ms: int) -> None:
-        self._sock.sendall(f"HOLD {int(x)} {int(y)} {int(duration_ms)}\n".encode())
-        self._read_line()
+    def hold(self, x: int, y: int, duration_ms: int):
+        gx, gy = self._to_gesture(x, y)
+        self._sock.sendall(f"HOLD {gx} {gy} {int(duration_ms)}\n".encode())
+        return self._read_line().decode(errors="replace").strip()
+
+    def info(self) -> str:
+        """Diagnostics: 'acc=<bool> capture=WxH real=WxH rot=N' from the bridge app."""
+        self._sock.sendall(b"INFO\n")
+        return self._read_line().decode(errors="replace").strip()
+
+    def global_action(self, name: str):
+        """Coordinate-free system action: BACK | HOME | SHADE."""
+        self._sock.sendall(f"GLOBAL {name}\n".encode())
+        return self._read_line().decode(errors="replace").strip()
+
+    def probe(self, gx: int, gy: int):
+        """Draw a calibration dot at gesture coord (gx,gy) (raw, no transform)."""
+        self._sock.sendall(f"PROBE {int(gx)} {int(gy)}\n".encode())
+        return self._read_line().decode(errors="replace").strip()
 
 
 def open_device(cfg) -> Device:

@@ -17,6 +17,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.DisplayMetrics
 import android.view.WindowManager
 import java.io.ByteArrayOutputStream
 
@@ -64,10 +65,9 @@ class CaptureService : Service() {
             override fun onStop() { cleanup() }
         }, Handler(Looper.getMainLooper()))
 
-        val wm = getSystemService(WindowManager::class.java)
-        val bounds = wm.maximumWindowMetrics.bounds
-        vWidth = bounds.width()
-        vHeight = bounds.height()
+        val (w, h) = currentSize()
+        vWidth = w
+        vHeight = h
         val density = resources.displayMetrics.densityDpi
 
         val reader = ImageReader.newInstance(vWidth, vHeight, PixelFormat.RGBA_8888, 2)
@@ -77,10 +77,70 @@ class CaptureService : Service() {
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             reader.surface, null, null
         )
+        // Keep capture matched to the live display size/orientation (game is landscape),
+        // so captured pixels == gesture coordinates (1:1, no letterbox).
+        getSystemService(DisplayManager::class.java)
+            .registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
 
-        bridge = BridgeServer(PORT, ::latestJpeg) { x, y, dur ->
-            TapAccessibilityService.instance?.tap(x, y, dur)
-        }.also { it.start() }
+        bridge = BridgeServer(
+            PORT,
+            ::latestJpeg,
+            onTap = { x, y, dur ->
+                TapAccessibilityService.instance?.tap(x, y, dur) ?: "no_acc"
+            },
+            onGlobal = { cmd ->
+                val action = when (cmd) {
+                    "BACK" -> android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK
+                    "HOME" -> android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME
+                    "SHADE" -> android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS
+                    else -> -1
+                }
+                val svc = TapAccessibilityService.instance
+                when {
+                    action < 0 || svc == null -> -1
+                    svc.global(action) -> 1
+                    else -> 0
+                }
+            },
+            onProbe = { x, y -> TapAccessibilityService.instance?.showDot(x, y) },
+            getInfo = {
+                val acc = TapAccessibilityService.instance != null
+                val wm = getSystemService(WindowManager::class.java)
+                @Suppress("DEPRECATION")
+                val disp = wm.defaultDisplay
+                val dm = android.util.DisplayMetrics()
+                @Suppress("DEPRECATION")
+                disp.getRealMetrics(dm)
+                @Suppress("DEPRECATION")
+                val rot = disp.rotation
+                "acc=$acc capture=${vWidth}x${vHeight} real=${dm.widthPixels}x${dm.heightPixels} rot=$rot"
+            },
+        ).also { it.start() }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentSize(): Pair<Int, Int> {
+        val disp = getSystemService(WindowManager::class.java).defaultDisplay
+        val dm = DisplayMetrics()
+        disp.getRealMetrics(dm)
+        return Pair(dm.widthPixels, dm.heightPixels)
+    }
+
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            val (w, h) = currentSize()
+            if (w != vWidth || h != vHeight) {
+                val newReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                virtualDisplay?.resize(w, h, resources.displayMetrics.densityDpi)
+                virtualDisplay?.surface = newReader.surface
+                imageReader?.close()
+                imageReader = newReader
+                vWidth = w
+                vHeight = h
+            }
+        }
     }
 
     private fun latestJpeg(): ByteArray? {
@@ -107,6 +167,9 @@ class CaptureService : Service() {
     }
 
     private fun cleanup() {
+        try {
+            getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayListener)
+        } catch (_: Exception) {}
         try { bridge?.stop() } catch (_: Exception) {}
         try { virtualDisplay?.release() } catch (_: Exception) {}
         try { imageReader?.close() } catch (_: Exception) {}

@@ -19,7 +19,10 @@ import java.net.Socket
 class BridgeServer(
     private val port: Int,
     private val getJpeg: () -> ByteArray?,
-    private val onTap: (Float, Float, Long) -> Unit,
+    private val onTap: (Float, Float, Long) -> String,
+    private val getInfo: () -> String,
+    private val onGlobal: (String) -> Int,
+    private val onProbe: (Int, Int) -> Unit,
 ) {
     @Volatile private var running = false
     private var thread: Thread? = null
@@ -73,13 +76,22 @@ class BridgeServer(
                     out.flush()
                 }
                 "TAP" -> {
-                    onTap(p[1].toFloat(), p[2].toFloat(), 30L)
-                    out.writeBytes("OK\n"); out.flush()
+                    val r = onTap(p[1].toFloat(), p[2].toFloat(), 30L)
+                    out.writeBytes("OK $r\n"); out.flush()
                 }
                 "HOLD" -> {
-                    onTap(p[1].toFloat(), p[2].toFloat(), p[3].toLong())
+                    val r = onTap(p[1].toFloat(), p[2].toFloat(), p[3].toLong())
+                    out.writeBytes("OK $r\n"); out.flush()
+                }
+                "GLOBAL" -> {
+                    val r = onGlobal(p.getOrNull(1) ?: "")
+                    out.writeBytes("OK $r\n"); out.flush()
+                }
+                "PROBE" -> {
+                    onProbe(p[1].toInt(), p[2].toInt())
                     out.writeBytes("OK\n"); out.flush()
                 }
+                "INFO" -> { out.writeBytes(getInfo() + "\n"); out.flush() }
                 "PING" -> { out.writeBytes("PONG\n"); out.flush() }
                 else -> { out.writeBytes("ERR\n"); out.flush() }
             }
