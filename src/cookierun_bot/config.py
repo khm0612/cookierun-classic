@@ -46,6 +46,10 @@ class Config:
     menu_allowlist: list[str]
     menu_denylist: list[str]
     templates_dir: str
+    # Windows-native input (for emulators like BlueStacks that block `adb shell input`).
+    window_title: str = "BlueStacks App Player"
+    window_top_bar: int = 40
+    window_right_bar: int = 40
 
 
 _REQUIRED_REGIONS = [
@@ -72,6 +76,7 @@ def load_config(path: str = "config.yaml") -> Config:
         g = raw["gestures"]
         rw = raw["reward"]
         menu = raw["menu"]
+        win = raw.get("window", {})
         return Config(
             device_serial=dev.get("serial"),
             capture_backend=dev.get("capture", "scrcpy"),
@@ -86,6 +91,9 @@ def load_config(path: str = "config.yaml") -> Config:
             menu_allowlist=list(menu["allowlist"]),
             menu_denylist=list(menu["denylist"]),
             templates_dir=str(raw.get("templates_dir", "templates")),
+            window_title=str(win.get("title", "BlueStacks App Player")),
+            window_top_bar=int(win.get("top_bar", 40)),
+            window_right_bar=int(win.get("right_bar", 40)),
         )
     except KeyError as exc:
         raise ConfigError(f"missing config key: {exc}") from exc
