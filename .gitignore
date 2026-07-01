@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+config.yaml
+templates/
+recordings/
+runs/
+*.zip
+calibration_screenshot.png
+scratch_*.py
