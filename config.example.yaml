@@ -1,0 +1,15 @@
+# Copy to config.yaml and calibrate coords with `python -m cookierun_bot.calibrate`.
+device: {serial: null, capture: scrcpy, max_fps: 60}
+loop: {target_stage: "Episode 1", decision_hz: 15}
+regions:              # [x, y, w, h] on the CAPTURED frame — calibrate per device
+  play_area: [0, 200, 1080, 1200]
+  coin_counter: [800, 40, 200, 60]
+  mystery_box_counter: [500, 40, 120, 60]
+  results_coins: [400, 900, 300, 80]
+  results_ingredients: [400, 1000, 300, 80]
+gestures: {jump_button: [200, 1600], slide_button: [880, 1600], slide_hold_ms: 300}
+reward: {w_coin: 1.0, w_box: 50.0, w_survive: 0.01, death_penalty: 10.0}
+menu:
+  allowlist: [restart, replay, collect, ok, start]
+  denylist: [revive_crystals, buy, purchase, watch_ad]
+templates_dir: templates
