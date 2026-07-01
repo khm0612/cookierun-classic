@@ -655,10 +655,11 @@ def _cfg(regions):
 
 
 def test_template_matcher_finds_known_template(tmp_path):
-    tpl = np.full((30, 30, 3), 200, dtype=np.uint8)
+    tpl = np.zeros((30, 30, 3), dtype=np.uint8)
+    tpl[:15, :] = 200                               # patterned so TM_CCOEFF_NORMED is well-defined
     cv2.imwrite(str(tmp_path / "blob.png"), tpl)
     frame = np.zeros((200, 200, 3), dtype=np.uint8)
-    frame[100:130, 50:80] = 200                     # place the template
+    frame[100:130, 50:80] = tpl                     # place identical patch
     m = TemplateMatcher(str(tmp_path))
     assert m.present(frame, "blob", threshold=0.9) is True
     assert m.find(frame, "blob", threshold=0.9) is not None
@@ -737,11 +738,17 @@ def read_int(frame, region) -> "int | None":
         import pytesseract
     except ImportError:
         return None
-    crop = region.crop(frame)
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    txt = pytesseract.image_to_string(
-        thresh, config="--psm 7 -c tessedit_char_whitelist=0123456789")
+    # ponytail: OCR is a best-effort screen read at a trust boundary — any failure
+    # (missing tesseract binary, bad crop, decode error) must degrade to "unknown"
+    # (None) rather than crash the running bot, so we catch broadly here.
+    try:
+        crop = region.crop(frame)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        txt = pytesseract.image_to_string(
+            thresh, config="--psm 7 -c tessedit_char_whitelist=0123456789")
+    except Exception:
+        return None
     digits = re.sub(r"\D", "", txt)
     return int(digits) if digits else None
 
