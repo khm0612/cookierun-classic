@@ -138,7 +138,78 @@ class BlueStacksDevice:
         win_input.hold(sx, sy, duration_ms)
 
 
+class NetworkDevice:
+    """Talks to the on-device CR Bridge app over TCP/Wi-Fi: capture via MediaProjection,
+    input via AccessibilityService. No ADB, no developer options. Coordinates are in
+    captured-frame (phone screen) pixels."""
+    def __init__(self, host: str, port: int = 8080, timeout: float = 5.0):
+        self._host = host
+        self._port = port
+        self._timeout = timeout
+        self._sock = None
+        self._guest_size: tuple[int, int] | None = None
+
+    def start(self) -> None:
+        import socket
+        s = socket.create_connection((self._host, self._port), timeout=self._timeout)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._sock = s
+
+    def stop(self) -> None:
+        try:
+            if self._sock is not None:
+                self._sock.close()
+        except Exception:
+            pass
+        self._sock = None
+
+    def _recv_exact(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = self._sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("bridge socket closed")
+            buf += chunk
+        return buf
+
+    def _read_line(self) -> bytes:
+        line = b""
+        while not line.endswith(b"\n"):
+            c = self._sock.recv(1)
+            if not c:
+                break
+            line += c
+        return line
+
+    def last_frame(self):
+        import numpy as np
+        import cv2
+        self._sock.sendall(b"FRAME\n")
+        n = int.from_bytes(self._recv_exact(4), "big")
+        if n == 0:
+            return None
+        data = self._recv_exact(n)
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)  # BGR
+        if img is not None:
+            self._guest_size = (img.shape[1], img.shape[0])
+        return img
+
+    @property
+    def resolution(self) -> tuple[int, int]:
+        return self._guest_size or (0, 0)
+
+    def tap(self, x: int, y: int) -> None:
+        self._sock.sendall(f"TAP {int(x)} {int(y)}\n".encode())
+        self._read_line()
+
+    def hold(self, x: int, y: int, duration_ms: int) -> None:
+        self._sock.sendall(f"HOLD {int(x)} {int(y)} {int(duration_ms)}\n".encode())
+        self._read_line()
+
+
 def open_device(cfg) -> Device:
+    if cfg.capture_backend == "network":
+        return NetworkDevice(cfg.phone_host, cfg.phone_port)
     if cfg.capture_backend == "bluestacks":
         return BlueStacksDevice(cfg.device_serial, cfg.window_title,
                                 cfg.window_top_bar, cfg.window_right_bar)

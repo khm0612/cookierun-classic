@@ -9,3 +9,9 @@ runs/
 *.zip
 calibration_screenshot.png
 scratch_*.py
+CRBridge-debug.apk
+android-bridge/.gradle/
+android-bridge/build/
+android-bridge/app/build/
+android-bridge/local.properties
+android-bridge/.idea/

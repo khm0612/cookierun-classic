@@ -50,6 +50,9 @@ class Config:
     window_title: str = "BlueStacks App Player"
     window_top_bar: int = 40
     window_right_bar: int = 40
+    # On-device bridge app (capture_backend == "network").
+    phone_host: str = ""
+    phone_port: int = 8080
 
 
 _REQUIRED_REGIONS = [
@@ -94,6 +97,8 @@ def load_config(path: str = "config.yaml") -> Config:
             window_title=str(win.get("title", "BlueStacks App Player")),
             window_top_bar=int(win.get("top_bar", 40)),
             window_right_bar=int(win.get("right_bar", 40)),
+            phone_host=str(raw.get("phone", {}).get("host", "")),
+            phone_port=int(raw.get("phone", {}).get("port", 8080)),
         )
     except KeyError as exc:
         raise ConfigError(f"missing config key: {exc}") from exc
