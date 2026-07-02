@@ -1,3 +1,5 @@
+import sys
+import types
 import numpy as np
 import cv2
 import pytest
@@ -40,6 +42,19 @@ def test_read_int_reads_digits():
     frame[0:60, 0:200] = _digit_image("1234")
     val = read_int(frame, Region(0, 0, 200, 60))
     assert val == 1234
+
+
+def test_read_int_can_use_digit_templates_without_tesseract(tmp_path, monkeypatch):
+    digits_dir = tmp_path / "digits"
+    digits_dir.mkdir()
+    for d in "0123456789":
+        cv2.imwrite(str(digits_dir / f"{d}.png"), _digit_image(d, size=(60, 80)))
+    frame = np.zeros((100, 260, 3), dtype=np.uint8)
+    frame[0:80, 0:260] = _digit_image("1203", size=(260, 80))
+    fake = types.SimpleNamespace(image_to_string=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no binary")))
+    monkeypatch.setitem(sys.modules, "pytesseract", fake)
+
+    assert read_int(frame, Region(0, 0, 260, 80), str(tmp_path)) == 1203
 
 
 def test_read_mystery_boxes_zero_on_unreadable():

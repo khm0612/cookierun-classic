@@ -76,6 +76,37 @@ def get_window_rect(hwnd):
     return (r.left, r.top, r.right, r.bottom)
 
 
+def grab_bbox(bbox):
+    """Grab a screen rectangle (left, top, right, bottom) as a BGR ndarray."""
+    import numpy as np
+    from PIL import ImageGrab
+    img = ImageGrab.grab(bbox=bbox, all_screens=True)
+    return np.asarray(img)[:, :, ::-1].copy()   # RGB -> BGR
+
+
+def match_gamearea(guest, win):
+    """Locate the guest frame inside a window grab (multi-scale template match).
+    Returns ((offset_x, offset_y), (width, height), confidence) in window pixels —
+    i.e. where/how big the emulator's game render sits within its host window."""
+    import numpy as np
+    import cv2
+    gh, gw = guest.shape[:2]
+    gg = cv2.cvtColor(guest, cv2.COLOR_BGR2GRAY)
+    gwn = cv2.cvtColor(win, cv2.COLOR_BGR2GRAY)
+    best = None
+    for s in [x / 1000.0 for x in range(450, 905, 10)]:
+        tw, th = int(gw * s), int(gh * s)
+        if tw < 60 or tw >= gwn.shape[1] or th >= gwn.shape[0]:
+            continue
+        tmpl = cv2.resize(gg, (tw, th), interpolation=cv2.INTER_AREA)
+        res = cv2.matchTemplate(gwn, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, mx, _, ml = cv2.minMaxLoc(res)
+        if best is None or mx > best[0]:
+            best = (mx, (ml[0], ml[1]), (tw, th))
+    conf, off, size = best
+    return off, size, conf
+
+
 def foreground(hwnd):
     import ctypes
     user32 = ctypes.windll.user32

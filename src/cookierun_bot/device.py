@@ -250,7 +250,62 @@ class NetworkDevice:
         return self._read_line().decode(errors="replace").strip()
 
 
+class LDPlayerDevice:
+    """LDPlayer: fast Windows window-grab capture (resized to guest coords) + adb input.
+    LDPlayer allows `adb shell input` (unlike BlueStacks), and window-grab (~13fps) is
+    far faster than adb screencap (~1fps at 2560x1440). Self-calibrates the game-area
+    rect inside the window once via template match, then re-queries the live window
+    position each frame so a moved window still works."""
+    def __init__(self, serial: str | None, window_title: str = "LDPlayer"):
+        self._adb = AdbDevice(serial)          # adb input + one-time calibration screencap
+        self._window_title = window_title
+        self._hwnd = None
+        self._off = (0, 0)                     # game-area offset within window (px)
+        self._ga = (0, 0)                      # game-area size within window (px)
+        self._guest = (2560, 1440)             # guest resolution (frame we present)
+
+    def start(self) -> None:
+        from . import win_input
+        win_input.set_dpi_aware()
+        self._hwnd = win_input.find_window(self._window_title)
+        if self._hwnd is None:
+            raise RuntimeError(f"emulator window not found: '{self._window_title}'")
+        guest = self._adb.last_frame()         # pure guest frame via adb screencap
+        if guest is None:
+            raise RuntimeError("adb screencap returned no frame for calibration")
+        self._guest = (guest.shape[1], guest.shape[0])
+        win = win_input.grab_bbox(win_input.get_window_rect(self._hwnd))
+        off, size, conf = win_input.match_gamearea(guest, win)
+        self._off, self._ga = off, size
+        self._calib_conf = conf
+
+    def stop(self) -> None:
+        pass
+
+    def last_frame(self):
+        from . import win_input
+        import cv2
+        rect = win_input.get_window_rect(self._hwnd)
+        gx, gy = rect[0] + self._off[0], rect[1] + self._off[1]
+        sub = win_input.grab_bbox((gx, gy, gx + self._ga[0], gy + self._ga[1]))
+        if sub is None or sub.size == 0:
+            return None
+        return cv2.resize(sub, self._guest, interpolation=cv2.INTER_AREA)
+
+    @property
+    def resolution(self) -> tuple[int, int]:
+        return self._guest
+
+    def tap(self, x: int, y: int) -> None:
+        self._adb.tap(x, y)
+
+    def hold(self, x: int, y: int, duration_ms: int) -> None:
+        self._adb.hold(x, y, duration_ms)
+
+
 def open_device(cfg) -> Device:
+    if cfg.capture_backend == "ldplayer":
+        return LDPlayerDevice(cfg.device_serial, cfg.window_title)
     if cfg.capture_backend == "network":
         return NetworkDevice(cfg.phone_host, cfg.phone_port)
     if cfg.capture_backend == "bluestacks":
