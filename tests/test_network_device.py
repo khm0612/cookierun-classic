@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
-from cookierun_bot.device import NetworkDevice
+import pytest
+from cookierun_bot.device import BridgeCommandError, NetworkDevice
 
 
 class FakeSock:
@@ -39,6 +40,12 @@ def test_hold_sends_duration_and_reads_ok():
     fake = FakeSock(b"OK\n")
     _nd(fake).hold(5, 6, 300)
     assert fake.sent == b"HOLD 5 6 300\n"
+
+
+def test_tap_raises_when_bridge_gesture_failed():
+    fake = FakeSock(b"OK no_acc\n")
+    with pytest.raises(BridgeCommandError):
+        _nd(fake).tap(12, 34)
 
 
 def test_last_frame_none_when_zero_length():

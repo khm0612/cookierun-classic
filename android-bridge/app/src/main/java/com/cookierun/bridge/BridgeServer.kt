@@ -76,20 +76,42 @@ class BridgeServer(
                     out.flush()
                 }
                 "TAP" -> {
-                    val r = onTap(p[1].toFloat(), p[2].toFloat(), 30L)
-                    out.writeBytes("OK $r\n"); out.flush()
+                    val x = p.getOrNull(1)?.toFloatOrNull()
+                    val y = p.getOrNull(2)?.toFloatOrNull()
+                    if (x == null || y == null) {
+                        out.writeBytes("ERR bad_tap\n")
+                    } else {
+                        val r = onTap(x, y, 30L)
+                        out.writeBytes("OK $r\n")
+                    }
+                    out.flush()
                 }
                 "HOLD" -> {
-                    val r = onTap(p[1].toFloat(), p[2].toFloat(), p[3].toLong())
-                    out.writeBytes("OK $r\n"); out.flush()
+                    val x = p.getOrNull(1)?.toFloatOrNull()
+                    val y = p.getOrNull(2)?.toFloatOrNull()
+                    val ms = p.getOrNull(3)?.toLongOrNull()
+                    if (x == null || y == null || ms == null) {
+                        out.writeBytes("ERR bad_hold\n")
+                    } else {
+                        val r = onTap(x, y, ms)
+                        out.writeBytes("OK $r\n")
+                    }
+                    out.flush()
                 }
                 "GLOBAL" -> {
                     val r = onGlobal(p.getOrNull(1) ?: "")
                     out.writeBytes("OK $r\n"); out.flush()
                 }
                 "PROBE" -> {
-                    onProbe(p[1].toInt(), p[2].toInt())
-                    out.writeBytes("OK\n"); out.flush()
+                    val x = p.getOrNull(1)?.toIntOrNull()
+                    val y = p.getOrNull(2)?.toIntOrNull()
+                    if (x == null || y == null) {
+                        out.writeBytes("ERR bad_probe\n")
+                    } else {
+                        onProbe(x, y)
+                        out.writeBytes("OK\n")
+                    }
+                    out.flush()
                 }
                 "INFO" -> { out.writeBytes(getInfo() + "\n"); out.flush() }
                 "PING" -> { out.writeBytes("PONG\n"); out.flush() }

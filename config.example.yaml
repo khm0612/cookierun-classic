@@ -1,14 +1,23 @@
 # Copy to config.yaml and calibrate coords with `python -m cookierun_bot.calibrate`.
-device: {serial: null, capture: scrcpy, max_fps: 60}
-loop: {target_stage: "Episode 1", decision_hz: 15}
+device: {serial: null, capture: ldplayer, max_fps: 120, adb_path: ""}
+window: {title: "LDPlayer", top_bar: 40, right_bar: 40}
+loop: {target_stage: "Episode 1", decision_hz: 60}
 regions:              # [x, y, w, h] on the CAPTURED frame — calibrate per device
   play_area: [0, 200, 1080, 1200]
   coin_counter: [800, 40, 200, 60]
   mystery_box_counter: [500, 40, 120, 60]
   results_coins: [400, 900, 300, 80]
   results_ingredients: [400, 1000, 300, 80]
-gestures: {jump_button: [200, 1600], slide_button: [880, 1600], slide_hold_ms: 300}
+gestures: {jump_button: [200, 1600], slide_button: [880, 1600], slide_hold_ms: 500, jump_hold_ms: 250}
 reward: {w_coin: 1.0, w_box: 50.0, w_survive: 0.01, death_penalty: 10.0}
+spending:
+  # Turn on only when you want the target-video behavior: spend coins on pre-run boosts.
+  allow_coin_boosts: false
+  max_boost_cost_per_run: 12000
+  double_coins_first_cost: 1200
+  double_coins_reroll_cost: 600
+  max_double_coin_rolls: 3
+  forbid_crystals: true
 menu:
   allowlist: [restart, replay, collect, ok, start]
   denylist: [revive_crystals, buy, purchase, watch_ad]

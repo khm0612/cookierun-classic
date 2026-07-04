@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import yaml
 
 
@@ -23,6 +23,7 @@ class Gestures:
     jump_button: tuple[int, int]
     slide_button: tuple[int, int]
     slide_hold_ms: int
+    jump_hold_ms: int = 250     # held press = higher/longer jump than a tap
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,16 @@ class RewardWeights:
     w_box: float
     w_survive: float
     death_penalty: float
+
+
+@dataclass(frozen=True)
+class SpendingConfig:
+    allow_coin_boosts: bool = False
+    max_boost_cost_per_run: int = 0
+    double_coins_first_cost: int = 1200
+    double_coins_reroll_cost: int = 600
+    max_double_coin_rolls: int = 3
+    forbid_crystals: bool = True
 
 
 @dataclass(frozen=True)
@@ -53,12 +64,29 @@ class Config:
     # On-device bridge app (capture_backend == "network").
     phone_host: str = ""
     phone_port: int = 8080
+    spending: SpendingConfig = field(default_factory=SpendingConfig)
+    adb_path: str = ""
 
 
 _REQUIRED_REGIONS = [
     "play_area", "coin_counter", "mystery_box_counter",
     "results_coins", "results_ingredients",
 ]
+CAPTURE_BACKENDS = {"scrcpy", "adb", "ldplayer", "bluestacks", "network"}
+
+
+def _read_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            return True
+        if v in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
 
 
 def load_config(path: str = "config.yaml") -> Config:
@@ -80,15 +108,23 @@ def load_config(path: str = "config.yaml") -> Config:
         rw = raw["reward"]
         menu = raw["menu"]
         win = raw.get("window", {})
+        spending = raw.get("spending", {})
+        capture = dev.get("capture", "scrcpy")
+        if capture not in CAPTURE_BACKENDS:
+            raise ConfigError(f"unknown capture backend: {capture}")
+        phone = raw.get("phone", {})
+        if capture == "network" and not phone.get("host"):
+            raise ConfigError("phone.host is required for network capture")
         return Config(
             device_serial=dev.get("serial"),
-            capture_backend=dev.get("capture", "scrcpy"),
+            capture_backend=capture,
             max_fps=int(dev.get("max_fps", 60)),
             decision_hz=int(loop["decision_hz"]),
             target_stage=str(loop["target_stage"]),
             regions=regions,
             gestures=Gestures(tuple(g["jump_button"]), tuple(g["slide_button"]),
-                              int(g["slide_hold_ms"])),
+                              int(g["slide_hold_ms"]),
+                              jump_hold_ms=int(g.get("jump_hold_ms", 250))),
             reward=RewardWeights(float(rw["w_coin"]), float(rw["w_box"]),
                                  float(rw["w_survive"]), float(rw["death_penalty"])),
             menu_allowlist=list(menu["allowlist"]),
@@ -97,8 +133,17 @@ def load_config(path: str = "config.yaml") -> Config:
             window_title=str(win.get("title", "BlueStacks App Player")),
             window_top_bar=int(win.get("top_bar", 40)),
             window_right_bar=int(win.get("right_bar", 40)),
-            phone_host=str(raw.get("phone", {}).get("host", "")),
-            phone_port=int(raw.get("phone", {}).get("port", 8080)),
+            phone_host=str(phone.get("host", "")),
+            phone_port=int(phone.get("port", 8080)),
+            adb_path=str(dev.get("adb_path", "")),
+            spending=SpendingConfig(
+                allow_coin_boosts=_read_bool(spending.get("allow_coin_boosts"), False),
+                max_boost_cost_per_run=int(spending.get("max_boost_cost_per_run", 0)),
+                double_coins_first_cost=int(spending.get("double_coins_first_cost", 1200)),
+                double_coins_reroll_cost=int(spending.get("double_coins_reroll_cost", 600)),
+                max_double_coin_rolls=int(spending.get("max_double_coin_rolls", 3)),
+                forbid_crystals=_read_bool(spending.get("forbid_crystals"), True),
+            ),
         )
     except KeyError as exc:
         raise ConfigError(f"missing config key: {exc}") from exc

@@ -31,8 +31,8 @@ def test_step_jump_taps_and_returns_five_tuple(fake_device):
     fake_device.set_frame(np.zeros((400, 400, 3), np.uint8))
     env = CookieRunEnv(fake_device, _cfg(), StubMatcher(), tick_sleep=lambda: None)
     env.reset()
-    obs, reward, terminated, truncated, info = env.step(1)   # jump
-    assert fake_device.taps == [(10, 20)]
+    obs, reward, terminated, truncated, info = env.step(1)   # jump (held press by default)
+    assert fake_device.holds == [(10, 20, 250)]
     assert obs.shape == (4, 84, 84)
     assert terminated is False
     assert set(["coins", "boxes", "dead"]).issubset(info)

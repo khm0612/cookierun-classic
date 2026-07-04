@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 import pytest
 from cookierun_bot.config import Region, Config, Gestures, RewardWeights
+from cookierun_bot import detect
 from cookierun_bot.detect import (
     TemplateMatcher, read_int, read_mystery_boxes,
 )
@@ -29,6 +30,8 @@ def test_template_matcher_finds_known_template(tmp_path):
     frame = np.zeros((200, 200, 3), dtype=np.uint8)
     frame[100:130, 50:80] = tpl                     # place identical patch
     m = TemplateMatcher(str(tmp_path))
+    assert m.has("blob") is True
+    assert m.has("missing") is False
     assert m.present(frame, "blob", threshold=0.9) is True
     assert m.find(frame, "blob", threshold=0.9) is not None
     assert m.present(np.zeros((200, 200, 3), np.uint8), "blob") is False
@@ -55,6 +58,26 @@ def test_read_int_can_use_digit_templates_without_tesseract(tmp_path, monkeypatc
     monkeypatch.setitem(sys.modules, "pytesseract", fake)
 
     assert read_int(frame, Region(0, 0, 260, 80), str(tmp_path)) == 1203
+
+
+def test_read_int_prefers_cached_digit_templates(tmp_path, monkeypatch):
+    digits_dir = tmp_path / "digits"
+    digits_dir.mkdir()
+    for d in "0123456789":
+        cv2.imwrite(str(digits_dir / f"{d}.png"), _digit_image(d, size=(60, 80)))
+    frame = np.zeros((100, 260, 3), dtype=np.uint8)
+    frame[0:80, 0:260] = _digit_image("1203", size=(260, 80))
+    detect._load_digit_templates.cache_clear()
+    monkeypatch.setattr(
+        detect,
+        "_read_int_tesseract",
+        lambda crop: (_ for _ in ()).throw(AssertionError("slow OCR should not run")),
+    )
+
+    assert read_int(frame, Region(0, 0, 260, 80), str(tmp_path)) == 1203
+    before = detect._load_digit_templates.cache_info().hits
+    assert read_int(frame, Region(0, 0, 260, 80), str(tmp_path)) == 1203
+    assert detect._load_digit_templates.cache_info().hits == before + 1
 
 
 def test_read_mystery_boxes_zero_on_unreadable():

@@ -1,14 +1,33 @@
+# --- Python ---
 __pycache__/
 *.pyc
+*.egg-info/
+.pytest_cache/
+.pytest_tmp/
 .venv/
 venv/
+
+# --- local config & assets (machine-specific) ---
 config.yaml
 templates/
+
+# --- data: training recordings, diagnostics, logs, models (large / machine-local) ---
+data/
 recordings/
 runs/
+
+# --- transient debug artifacts (screenshots produced while tuning) ---
+*.png
+!docs/**/*.png
+*.log
+*.out
+*.err
 *.zip
-calibration_screenshot.png
+
+# --- scratch / one-off scripts ---
 scratch_*.py
+
+# --- android bridge build output ---
 CRBridge-debug.apk
 android-bridge/.gradle/
 android-bridge/build/

@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 import re
 import glob
+from functools import lru_cache
 import cv2
 import numpy as np
 
@@ -13,7 +14,9 @@ class TemplateMatcher:
         self._templates: dict[str, np.ndarray] = {}
         for path in glob.glob(os.path.join(templates_dir, "*.png")):
             name = os.path.splitext(os.path.basename(path))[0]
-            self._templates[name] = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if img is not None:               # unreadable file => has() must say missing
+                self._templates[name] = img
 
     def _match(self, frame, name):
         tpl = self._templates.get(name)
@@ -30,6 +33,9 @@ class TemplateMatcher:
         m = self._match(frame, name)
         return bool(m and m[0] >= threshold)
 
+    def has(self, name: str) -> bool:
+        return name in self._templates
+
     def find(self, frame, name, threshold: float = 0.8):
         m = self._match(frame, name)
         if not m or m[0] < threshold:
@@ -38,21 +44,24 @@ class TemplateMatcher:
         return (mx + tw // 2, my + th // 2)   # center point
 
 
+def _light_digit_mask(hsv) -> np.ndarray:
+    return cv2.inRange(hsv, np.array([0, 0, 160]), np.array([179, 160, 255]))
+
+
+def _dark_digit_mask(hsv) -> np.ndarray:
+    return cv2.inRange(hsv, np.array([0, 0, 0]), np.array([179, 255, 135]))
+
+
 def _digit_mask(img) -> np.ndarray:
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV) if img.ndim == 3 else None
     if hsv is not None:
-        light = cv2.inRange(hsv, np.array([0, 0, 160]), np.array([179, 95, 255]))
-        dark = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([179, 255, 135]))
-        dark_frac = float((dark > 0).mean())
-        light_frac = float((light > 0).mean())
-        if 0.02 <= dark_frac <= 0.70 and (float(np.median(hsv[:, :, 2])) > 120 or light_frac > 0.35):
-            mask = dark
+        if float(np.median(hsv[:, :, 2])) > 150 and float(np.median(hsv[:, :, 1])) < 100:
+            mask = _dark_digit_mask(hsv)
         else:
-            mask = light
+            mask = _light_digit_mask(hsv)
     else:
         mask = cv2.inRange(img, 180, 255)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return mask
 
 
 def _normalize_digit(mask) -> "np.ndarray | None":
@@ -65,8 +74,10 @@ def _normalize_digit(mask) -> "np.ndarray | None":
     return cv2.resize(mask[y:y + h, x:x + w], _DIGIT_SIZE, interpolation=cv2.INTER_AREA)
 
 
-def _load_digit_templates(templates_dir: str) -> dict[str, list[np.ndarray]]:
+@lru_cache(maxsize=8)
+def _load_digit_templates(templates_dir: str) -> dict[str, tuple[np.ndarray, ...]]:
     templates = {}
+    seen = set()
     for d in "0123456789":
         paths = glob.glob(os.path.join(templates_dir, "digits", f"{d}*.png"))
         paths += [os.path.join(templates_dir, f"digit_{d}.png")]
@@ -76,17 +87,23 @@ def _load_digit_templates(templates_dir: str) -> dict[str, list[np.ndarray]]:
             img = cv2.imread(path)
             if img is None:
                 continue
-            norm = _normalize_digit(_digit_mask(img))
-            if norm is not None:
-                templates.setdefault(d, []).append(norm)
-    return templates
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV) if img.ndim == 3 else None
+            masks = [_digit_mask(img)]
+            if hsv is not None:
+                masks.extend([_light_digit_mask(hsv), _dark_digit_mask(hsv)])
+            for mask in masks:
+                norm = _normalize_digit(mask)
+                if norm is not None and norm.tobytes() not in seen:
+                    templates.setdefault(d, []).append(norm)
+                    seen.add(norm.tobytes())
+    return {digit: tuple(variants) for digit, variants in templates.items()}
 
 
 def _digit_boxes(crop) -> list[tuple[int, int, int, int]]:
     mask = _digit_mask(crop)
     num, _, stats, _ = cv2.connectedComponentsWithStats(mask)
     boxes = []
-    min_h = max(14, int(crop.shape[0] * 0.40))
+    min_h = max(14, int(crop.shape[0] * 0.35))
     for i in range(1, num):
         x, y, w, h, area = [int(v) for v in stats[i]]
         if h < min_h or area < 40:
@@ -145,12 +162,11 @@ def _read_int_tesseract(crop) -> "int | None":
 
 def read_int(frame, region, templates_dir: str | None = None) -> "int | None":
     crop = region.crop(frame)
-    val = _read_int_tesseract(crop)
-    if val is not None:
-        return val
     if templates_dir:
-        return _read_int_digit_templates(frame, region, templates_dir)
-    return None
+        val = _read_int_digit_templates(frame, region, templates_dir)
+        if val is not None:
+            return val
+    return _read_int_tesseract(crop)
 
 
 def detect_death(frame, matcher: TemplateMatcher) -> bool:

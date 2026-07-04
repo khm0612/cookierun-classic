@@ -7,8 +7,14 @@ def test_noop_does_nothing(fake_device):
     assert fake_device.taps == [] and fake_device.holds == []
 
 
-def test_jump_taps_jump_button(fake_device):
+def test_jump_holds_jump_button_for_higher_arc(fake_device):
     apply_action(fake_device, ACTION_JUMP, Gestures((200, 1600), (880, 1600), 300))
+    assert fake_device.holds == [(200, 1600, 250)]   # default jump_hold_ms
+
+
+def test_jump_taps_when_hold_disabled(fake_device):
+    g = Gestures((200, 1600), (880, 1600), 300, jump_hold_ms=0)
+    apply_action(fake_device, ACTION_JUMP, g)
     assert fake_device.taps == [(200, 1600)]
 
 

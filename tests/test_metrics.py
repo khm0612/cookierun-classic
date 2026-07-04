@@ -10,6 +10,15 @@ def test_rates_computed_over_total_time():
     assert round(m.ingredients_per_hour(), 1) == 90.0
 
 
+def test_net_coin_metrics_subtract_boost_cost():
+    m = Metrics()
+    m.add(RunResult(coins=5000, ingredients=1, duration_s=1800.0, boost_cost=1200))
+    assert m.total_coins() == 5000
+    assert m.total_boost_cost() == 1200
+    assert m.total_net_coins() == 3800
+    assert round(m.net_coins_per_hour(), 1) == 7600.0
+
+
 def test_empty_metrics_zero_rates():
     m = Metrics()
     assert m.coins_per_hour() == 0.0

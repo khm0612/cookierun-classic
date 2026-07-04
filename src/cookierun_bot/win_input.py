@@ -76,6 +76,25 @@ def get_window_rect(hwnd):
     return (r.left, r.top, r.right, r.bottom)
 
 
+def monitor_of_window(hwnd):
+    """Virtual-desktop rect (left, top, right, bottom) of the monitor hosting hwnd."""
+    import ctypes
+    import ctypes.wintypes
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.wintypes.DWORD),
+                    ("rcMonitor", ctypes.wintypes.RECT),
+                    ("rcWork", ctypes.wintypes.RECT),
+                    ("dwFlags", ctypes.wintypes.DWORD)]
+
+    mon = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)   # MONITOR_DEFAULTTONEAREST
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(MONITORINFO)
+    ctypes.windll.user32.GetMonitorInfoW(mon, ctypes.byref(mi))
+    r = mi.rcMonitor
+    return (r.left, r.top, r.right, r.bottom)
+
+
 def grab_bbox(bbox):
     """Grab a screen rectangle (left, top, right, bottom) as a BGR ndarray."""
     import numpy as np
@@ -94,7 +113,7 @@ def match_gamearea(guest, win):
     gg = cv2.cvtColor(guest, cv2.COLOR_BGR2GRAY)
     gwn = cv2.cvtColor(win, cv2.COLOR_BGR2GRAY)
     best = None
-    for s in [x / 1000.0 for x in range(450, 905, 10)]:
+    for s in [x / 1000.0 for x in range(250, 1055, 10)]:
         tw, th = int(gw * s), int(gh * s)
         if tw < 60 or tw >= gwn.shape[1] or th >= gwn.shape[0]:
             continue
@@ -103,6 +122,8 @@ def match_gamearea(guest, win):
         _, mx, _, ml = cv2.minMaxLoc(res)
         if best is None or mx > best[0]:
             best = (mx, (ml[0], ml[1]), (tw, th))
+    if best is None:
+        raise RuntimeError("could not locate emulator game area inside window")
     conf, off, size = best
     return off, size, conf
 
