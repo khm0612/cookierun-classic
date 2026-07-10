@@ -424,12 +424,20 @@ def _restart_game(cfg, log=print, should_stop=None) -> None:
     base = [adb] + (["-s", cfg.device_serial] if cfg.device_serial else [])
     pkg = "com.devsisters.crg"
     log("!! stuck - restarting game to recover")
-    subprocess.run(base + ["shell", "am", "force-stop", pkg])
-    _sleep_interruptible(1.5, should_stop)
-    if _stop_requested(should_stop):
+    # adb going offline/unresponsive is a named failure mode: bound both calls (like every
+    # other adb call in this file) so a wedged adb server surfaces as a recoverable error
+    # instead of hanging the whole unattended loop inside the very routine meant to un-stick it.
+    try:
+        subprocess.run(base + ["shell", "am", "force-stop", pkg], timeout=15)
+        _sleep_interruptible(1.5, should_stop)
+        if _stop_requested(should_stop):
+            return
+        subprocess.run(base + ["shell", "am", "start", "-n",
+                               pkg + "/com.devsisters.CookieRunForKakao.OvenbreakX"],
+                       timeout=15)
+    except subprocess.TimeoutExpired:
+        log("!! adb unresponsive during game restart (timed out) - retrying next cycle")
         return
-    subprocess.run(base + ["shell", "am", "start", "-n",
-                           pkg + "/com.devsisters.CookieRunForKakao.OvenbreakX"])
     # ponytail: don't burn a fixed splash delay; ensure_running already polls real frames.
     _sleep_interruptible(3.0, should_stop)
 
@@ -591,6 +599,14 @@ def farm(cfg_path: str = "config.yaml", max_runs: int | None = None,
             crashes = 0
             cycle_s = time.monotonic() - cycle_t0
             run += 1
+            if not results.get("read_ok", True):
+                # The Result screen was never genuinely read (a card / level-up / Mystery-Box
+                # screen hid it, or the coin digits misread to 0). A completed run never truly
+                # banks 0 coins, so book it as UNREAD — never as a real 0-coin/negative-net run
+                # that would drag coins/hr and net/hr below the truth (matches scripts/ai_farm).
+                log(f"[run {run}] UNREAD — Result screen missed; banked but uncounted "
+                    f"survived={dur:.0f}s cycle={cycle_s:.0f}s | {metrics.summary()}")
+                continue
             result = RunResult(
                 results["coins"], results["ingredients"], cycle_s,
                 boost_cost=cycle["boost_cost"],

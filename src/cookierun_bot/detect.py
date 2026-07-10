@@ -8,6 +8,13 @@ import numpy as np
 
 _DIGIT_SIZE = (32, 48)
 
+# Digit-classification gates for the template OCR path (TM_CCOEFF_NORMED on the normalized
+# 32x48 glyph bitmap). Deliberately lenient: a genuinely below-threshold OR near-tie digit
+# makes the WHOLE number untrustworthy (returns None -> Tesseract) rather than emitting a
+# silently-wrong partial read. Validate against real result crops before tightening these.
+_DIGIT_ACCEPT = 0.35
+_DIGIT_MARGIN = 0.03
+
 
 class TemplateMatcher:
     def __init__(self, templates_dir: str):
@@ -125,18 +132,23 @@ def _read_int_digit_templates(frame, region, templates_dir: str) -> "int | None"
         norm = _normalize_digit(mask[y:y + h, x:x + w])
         if norm is None:
             continue
-        best_digit = None
-        best_score = -1.0
+        best_digit, best_score, second_score = None, -1.0, -1.0
         for digit, variants in templates.items():
-            for template in variants:
-                score = 1.0 - float(cv2.absdiff(norm, template).mean()) / 255.0
-                if score > best_score:
-                    best_digit = digit
-                    best_score = score
-        if best_digit is None or best_score < 0.55:
-            if not digits:
-                continue
-            break
+            # TM_CCOEFF_NORMED on the normalized bitmap is far more discriminative of glyph
+            # SHAPE than mean-abs-diff, which also rewards matching background pixels.
+            dscore = max(
+                float(cv2.matchTemplate(norm, template, cv2.TM_CCOEFF_NORMED)[0, 0])
+                for template in variants)
+            if dscore > best_score:
+                best_digit, best_score, second_score = digit, dscore, best_score
+            elif dscore > second_score:
+                second_score = dscore
+        # A digit we can't classify confidently (low score OR a near-tie between glyphs)
+        # makes the whole field untrustworthy: bail to None so read_int falls through to
+        # Tesseract, instead of the old continue/break that silently dropped a leading digit
+        # or truncated the tail (10x/1000x under-reads that passed downstream unchecked).
+        if best_digit is None or best_score < _DIGIT_ACCEPT or best_score - second_score < _DIGIT_MARGIN:
+            return None
         digits.append(best_digit)
     return int("".join(digits)) if digits else None
 
@@ -151,7 +163,13 @@ def _read_int_tesseract(crop) -> "int | None":
     # (None) rather than crash the running bot, so we catch broadly here.
     try:
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        # Tesseract wants ~30px-tall DARK digits on a LIGHT background; game counters are
+        # small and light-on-dark, so upscale ~3x and flip polarity when the Otsu field
+        # comes out mostly dark (light glyphs on a dark ground).
+        gray = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if float(thresh.mean()) < 127.0:
+            thresh = cv2.bitwise_not(thresh)
         txt = pytesseract.image_to_string(
             thresh, config="--psm 7 -c tessedit_char_whitelist=0123456789")
     except Exception:

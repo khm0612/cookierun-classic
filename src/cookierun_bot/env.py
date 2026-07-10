@@ -1,3 +1,7 @@
+# ponytail: RL scaffold — CookieRunEnv + reward.RewardTracker are the Gymnasium env for the
+# PLANNED DQN warm-start path (see the farming-bot design doc), NOT wired into the shipped
+# behavioral-cloning pipeline (train2.py). Intentional, not dead code — don't delete (and
+# don't drop the gymnasium dep) without retiring that plan.
 from __future__ import annotations
 import time
 import numpy as np

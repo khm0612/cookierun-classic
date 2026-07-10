@@ -262,6 +262,22 @@ def test_read_run_result_flags_settled_zero_as_unread(monkeypatch):
     assert out == {"coins": 0, "ingredients": 0, "read_ok": False}
 
 
+def test_read_run_result_flags_zero_coins_with_ingredients_as_unread(monkeypatch):
+    """A coin OCR miss to 0 while ingredients read fine must be read_ok=False — a completed
+    run never truly banks 0 coins, so the coin read is UNREAD even if ingredients came through."""
+    result = np.full((4, 4, 3), 255, np.uint8)
+    monkeypatch.setattr(
+        farm_common, "read_results",
+        lambda frame, cfg: {"coins": 0, "ingredients": 7},
+    )
+    out = farm.read_run_result(
+        FakeDevice([result]), cfg=object(), matcher=OkMatcher(),
+        timeout_s=1.0, poll_s=0.5, settle_timeout_s=1.0,
+        sleep=lambda _: None, now=lambda: 0.0,
+    )
+    assert out == {"coins": 0, "ingredients": 7, "read_ok": False}
+
+
 class MenuWalletMatcher:
     def __init__(self, play=True):
         self._play = play
@@ -359,7 +375,7 @@ def test_restart_game_does_not_wait_full_splash(monkeypatch):
         adb_path = "adb"
         device_serial = "127.0.0.1:5555"
 
-    monkeypatch.setattr("subprocess.run", lambda cmd: calls.append(cmd))
+    monkeypatch.setattr("subprocess.run", lambda cmd, **kwargs: calls.append(cmd))
     monkeypatch.setattr(
         farm,
         "_sleep_interruptible",
@@ -667,3 +683,34 @@ def test_ensure_run_boosts_skips_invisible_tiles(monkeypatch):
 
     assert result == farm.BoostResult(False, 0)
     assert dev.taps == []
+
+
+class X2DepletedMatcher:
+    """hp & watch verify checked; the x2 tile is visible but never checks (owned stock
+    depleted). Records the last tile find() was asked about so tilecheck can answer per-tile."""
+
+    def __init__(self):
+        self._last = None
+
+    def find(self, frame, name, threshold=0.8):
+        if name in {"tile_hp", "tile_watch", "tile_x2"}:
+            self._last = name
+            return (100, 100)
+        return None
+
+    def present(self, roi, name, threshold=0.8):
+        return name == "tilecheck" and self._last in {"tile_hp", "tile_watch"}
+
+
+def test_ensure_run_boosts_treats_x2_stock_depletion_as_best_effort(monkeypatch):
+    monkeypatch.setattr(farm, "_sleep_interruptible", lambda *a, **k: None)
+    monkeypatch.setattr(farm, "_wait_for_change", lambda *a, **k: None)
+    dev = FakeDevice([np.zeros((400, 400, 3), np.uint8)])
+    dev.taps = []
+    dev.tap = lambda x, y: dev.taps.append((x, y))
+
+    result = farm.ensure_run_boosts(dev, X2DepletedMatcher(), _SPEND, log=lambda _: None)
+
+    # HP + watch verified (1600); x2 can't be checked (depleted stock) but is best-effort,
+    # so the gate must still report active rather than halt the farm.
+    assert result == farm.BoostResult(True, 1600)

@@ -181,11 +181,13 @@ def read_run_result(dev, cfg, matcher, timeout_s: float = 30.0,
         if current == last and (current["coins"] > 0 or current["ingredients"] > 0):
             streak += 1
             if streak >= stable_reads:
-                return _out(current, True)
+                # read_ok is COIN validity: a completed run never truly banks 0 coins, so a
+                # settled coins=0 (even with valid ingredients) is an UNREAD coin read.
+                return _out(current, current["coins"] > 0)
         else:
             last = current
             streak = 1
-    return _out(best, best["coins"] > 0 or best["ingredients"] > 0)
+    return _out(best, best["coins"] > 0)
 
 
 def read_wallet(dev, cfg, matcher, tries: int = 8, should_stop=None,

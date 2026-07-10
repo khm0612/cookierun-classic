@@ -333,6 +333,10 @@ class ControllerApp:
 
     def _append_log(self, line: str) -> None:
         self.log.insert("end", line + "\n")
+        # Cap the buffer: an overnight unattended session emits tens of thousands of lines,
+        # and an unbounded Tk Text widget grows memory and slows every insert. Keep the tail.
+        if int(self.log.index("end-1c").split(".")[0]) > 2000:
+            self.log.delete("1.0", "end-1000l")
         self.log.see("end")
 
     def load_defaults(self) -> None:

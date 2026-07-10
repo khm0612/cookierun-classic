@@ -1,3 +1,5 @@
+# ponytail: used only by env.py's CookieRunEnv (the planned-RL scaffold), not by the shipped
+# behavioral-cloning pipeline. Intentional — see the note atop env.py before deleting.
 from __future__ import annotations
 
 

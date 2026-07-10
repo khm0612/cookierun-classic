@@ -5,8 +5,9 @@ epoch is often not the best) and reports event-hit rate + false-fires/min on the
 tails at several confidence gates. Winner is saved to data/demo/model.pt (+meta).
 
 Spacing note: frame-stack spacing is expressed through meta['fps'] — LearnedAgent stacks
-at 1/fps seconds, so fps=17.5 == stride-2 over the 35fps recording with NO inference-code
-changes needed.
+at 1/fps seconds, so a config's fps = REC_FPS/stride == stride-N over the recording with NO
+inference-code changes needed. REC_FPS is MEASURED from the demos' real timestamps (below),
+so it tracks the recorder cadence instead of a stale hardcoded rate.
 """
 import os, json, sys, time, glob, copy
 from _runtime import DATA
@@ -62,6 +63,14 @@ IMGS_BIG = np.concatenate(IMGS)
 run_start = np.array(run_start)
 tr_ids = np.array(tr_ids); va_ids = np.array(va_ids)
 print(f"total {len(IMGS_BIG)} frames", flush=True)
+# Recording cadence is the single source of truth for frame-stack spacing: measure it from
+# the demos' real timestamps rather than assuming 35fps (the recorder now saves ~60fps). Each
+# config's meta['fps'] = REC_FPS/stride then matches its index-strided training spacing, so
+# LearnedAgent gates the live stack at the same span it trained on (no OOD drift).
+_dts = np.concatenate([np.diff(ts) for ts in TS if len(ts) > 1]) if TS else np.array([])
+if len(_dts):
+    REC_FPS = round(1.0 / float(np.median(_dts)), 1)
+    print(f"measured recording fps: {REC_FPS}", flush=True)
 
 def build_labels(win_pre, win_post, ny_lo, ny_hi):
     y = np.zeros(len(IMGS_BIG), np.int64)
@@ -200,20 +209,30 @@ for r in results:
     print(f"{r['name']:>16}: score {r['score']:.3f} | {r['hits']}/{r['events']} events "
           f"| {r['fam']:.0f} false/min | conf {r['conf']} | ep{r['ep']}", flush=True)
 win = results[0]
-# never overwrite a better deployed model: compare against the stored winner's score
+runset = sorted(os.path.basename(r) for r in runs)
+# Never overwrite a better deployed model — BUT only when the comparison is valid. score
+# depends on the demo set (val tail + event set = the last 15% of whatever demos exist), so a
+# score from a DIFFERENT run set isn't comparable. If the demos changed (e.g. you added some —
+# the #1 lever), deploy this round's winner instead of gating on a stale, incomparable number.
 prev_path = os.path.join(OUT, "sweep_results.json")
 prev_score = -1e9
+prev_runset = None
 if os.path.exists(prev_path):
     prev = json.load(open(prev_path))
+    prev_runset = prev.get("runs")
     if prev.get("board"):
         prev_score = prev["board"][0].get("score", -1e9)
-if win["score"] <= prev_score:
+comparable = prev_runset is not None and sorted(prev_runset) == runset
+if comparable and win["score"] <= prev_score:
     print(f"\n>> round winner {win['name']} (score {win['score']:.3f}) does NOT beat the "
-          f"deployed model (score {prev_score:.3f}) — keeping the deployed model.", flush=True)
+          f"deployed model (score {prev_score:.3f}) on the same demo set — keeping it.", flush=True)
 else:
+    if prev_runset is not None and not comparable:
+        print(f"\n>> demo set changed since last sweep (was {sorted(prev_runset)}, now "
+              f"{runset}); scores aren't comparable — deploying this round's winner.", flush=True)
     torch.save(win["state"], os.path.join(OUT, "model.pt"))
     json.dump(win["meta"], open(os.path.join(OUT, "model_meta.json"), "w"))
-    json.dump({"winner": win["name"], "conf": win["conf"],
+    json.dump({"winner": win["name"], "conf": win["conf"], "runs": runset,
                "board": [{k: r[k] for k in ("name", "score", "hits", "events", "fam", "conf", "ep")}
                          for r in results]},
               open(os.path.join(OUT, "sweep_results.json"), "w"), indent=1)
