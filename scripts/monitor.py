@@ -284,44 +284,49 @@ def _pump_supervisor(target: int) -> None:
             except Exception:
                 pass
 
-    while _sup["done"] < target and not _STOP.is_set():
-        _kill_stray_farm()                        # never allow two farms on one emulator
-        remaining = target - _sup["done"]
-        done_before = _sup["done"]
-        emit(f"[mon-sup] launching supervisor for {remaining} run(s) "
-             f"({_sup['done']}/{target} done, no-progress relaunch {no_progress}/{MAX_SUP_RELAUNCH})")
-        try:
-            p = subprocess.Popen([sys.executable, "-u", SUP_SCRIPT, str(remaining)],
-                                 cwd=str(ROOT), stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
-        except Exception as exc:
-            emit(f"[mon-sup] could not launch supervisor: {exc}")
-            break
-        _sup["proc"] = p
-        for line in p.stdout:
-            line = line.rstrip()
-            emit(line)
-            if line.startswith(">> RESULT:"):
-                _sup["done"] += 1
-        rc = p.wait()
-        _sup["proc"] = None
-        if _sup["done"] >= target or _STOP.is_set():
-            break
-        no_progress = 0 if _sup["done"] > done_before else no_progress + 1
-        if no_progress > MAX_SUP_RELAUNCH:
-            emit(f"[mon-sup] supervisor made no progress across {no_progress} relaunch(es) "
-                 f"(rc={rc}), {_sup['done']}/{target} done -- giving up. Check the emulator.")
-            break
-        emit(f"[mon-sup] supervisor exited rc={rc}; {target - _sup['done']} run(s) left "
-             "-- relaunching in 5s")
-        _STOP.wait(5)
-    emit(f"[mon-sup] DONE supervising: {_sup['done']}/{target} run(s)")
-    if logf is not None:
-        try:
-            logf.close()
-        except Exception:
-            pass
-    _sup["finished"] = True
+    try:
+        while _sup["done"] < target and not _STOP.is_set():
+            _kill_stray_farm()                        # never allow two farms on one emulator
+            remaining = target - _sup["done"]
+            done_before = _sup["done"]
+            emit(f"[mon-sup] launching supervisor for {remaining} run(s) "
+                 f"({_sup['done']}/{target} done, no-progress relaunch {no_progress}/{MAX_SUP_RELAUNCH})")
+            try:
+                p = subprocess.Popen([sys.executable, "-u", SUP_SCRIPT, str(remaining)],
+                                     cwd=str(ROOT), stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
+            except Exception as exc:
+                emit(f"[mon-sup] could not launch supervisor: {exc}")
+                break
+            _sup["proc"] = p
+            for line in p.stdout:
+                line = line.rstrip()
+                emit(line)
+                if line.startswith(">> RESULT:"):
+                    _sup["done"] += 1
+            rc = p.wait()
+            _sup["proc"] = None
+            if _sup["done"] >= target or _STOP.is_set():
+                break
+            no_progress = 0 if _sup["done"] > done_before else no_progress + 1
+            if no_progress > MAX_SUP_RELAUNCH:
+                emit(f"[mon-sup] supervisor made no progress across {no_progress} relaunch(es) "
+                     f"(rc={rc}), {_sup['done']}/{target} done -- giving up. Check the emulator.")
+                break
+            emit(f"[mon-sup] supervisor exited rc={rc}; {target - _sup['done']} run(s) left "
+                 "-- relaunching in 5s")
+            _STOP.wait(5)
+        emit(f"[mon-sup] DONE supervising: {_sup['done']}/{target} run(s)")
+    finally:
+        # ALWAYS mark finished, even if the pump crashes (e.g. a stdout UnicodeEncodeError in
+        # emit): main()'s only supervise-mode exit is _sup['finished'], so without this a dead
+        # pump would leave the monitor heartbeating forever against no running farm.
+        _sup["finished"] = True
+        if logf is not None:
+            try:
+                logf.close()
+            except Exception:
+                pass
 
 
 def test(path: str) -> None:
@@ -356,41 +361,50 @@ def main(supervise_target: "int | None" = None) -> None:
     hb = time.monotonic()
     try:
         while True:
-            if supervise_target and _sup["finished"]:
-                log("supervisor finished -- monitor exiting")
-                return
-            f = grab()
-            if f is None:
-                grab_fails += 1
-                if grab_fails >= GRAB_FAILS_BEFORE_RECONNECT:
-                    reconnect_adb()
-                    grab_fails = 0
-                time.sleep(POLL_S)
-                continue
-            grab_fails = 0
-            if matcher.present(f, "cardgame", CARD_THRESH) and not matcher.present(f, "play", 0.72):
-                _set_card_flag()                   # card seen -> veto nav BACK NOW, before the
-                                                   # 2-poll settle gate (closes the cold-start race
-                                                   # where nav could BACK a just-appeared card).
-                                                   # Play-veto: never arm on a menu/leaderboard frame.
-                seen += 1
-                if seen >= 2:                      # settle gate: 2 consecutive detections
-                    log("CARD GAME detected (settled) -- taking over")
-                    solve_cardgame(matcher)
+            try:
+                if supervise_target and _sup["finished"]:
+                    log("supervisor finished -- monitor exiting")
+                    return
+                f = grab()
+                if f is None:
+                    grab_fails += 1
+                    if grab_fails >= GRAB_FAILS_BEFORE_RECONNECT:
+                        reconnect_adb()
+                        grab_fails = 0
+                    time.sleep(POLL_S)
+                    continue
+                grab_fails = 0
+                if matcher.present(f, "cardgame", CARD_THRESH) and not matcher.present(f, "play", 0.72):
+                    _set_card_flag()                   # card seen -> veto nav BACK NOW, before the
+                                                       # 2-poll settle gate (closes the cold-start race
+                                                       # where nav could BACK a just-appeared card).
+                                                       # Play-veto: never arm on a menu/leaderboard frame.
+                    seen += 1
+                    if seen >= 2:                      # settle gate: 2 consecutive detections
+                        log("CARD GAME detected (settled) -- taking over")
+                        solve_cardgame(matcher)
+                        seen = 0
+                        hb = time.monotonic()
+                elif matcher.present(f, "league_results", 0.85):
+                    dismiss_modal(matcher, "league_results", (1280, 1210), "LEAGUE RESULTS")
                     seen = 0
                     hb = time.monotonic()
-            elif matcher.present(f, "league_results", 0.85):
-                dismiss_modal(matcher, "league_results", (1280, 1210), "LEAGUE RESULTS")
-                seen = 0
-                hb = time.monotonic()
-            else:
-                seen = 0
-                _clear_card_flag()                 # no card in view -> release the BACK veto
-            if time.monotonic() - hb > 120:
-                hb = time.monotonic()
-                extra = f" | farm {_sup['done']}/{_sup['target']}" if supervise_target else ""
-                log(f"heartbeat: watching, no card game{extra}")
-            time.sleep(POLL_S)
+                else:
+                    seen = 0
+                    _clear_card_flag()                 # no card in view -> release the BACK veto
+                if time.monotonic() - hb > 120:
+                    hb = time.monotonic()
+                    extra = f" | farm {_sup['done']}/{_sup['target']}" if supervise_target else ""
+                    log(f"heartbeat: watching, no card game{extra}")
+                time.sleep(POLL_S)
+            except Exception as exc:
+                # a transient per-frame blip (cv2/adb/decode) must NOT fall through to the
+                # finally below, which stops the supervisor and kills the running farm. The
+                # watcher has to be at least as crash-tolerant as what it watches — log and
+                # keep going. (KeyboardInterrupt/SystemExit aren't Exception, so a real
+                # Ctrl+C / shutdown still reaches the finally and cleans up.)
+                log(f"watch-loop error (continuing): {type(exc).__name__}: {exc}")
+                time.sleep(POLL_S)
     finally:
         # on ANY exit in supervise mode (finished / Ctrl+C / error), stop the pump from
         # relaunching and don't leave an orphaned farm running unattended.

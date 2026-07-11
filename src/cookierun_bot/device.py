@@ -735,6 +735,9 @@ class LDPlayerDevice:
             if best[1] is not None and best[0] > 0.6:
                 self._cam = best[1]
                 self._use_dx = True
+                # seed the freshness clock so the FIRST static-screen wait_frame() timeout
+                # can't trip the dead-duplicator heal (getattr default 0.0 => always stale).
+                self._last_fresh = time.monotonic()
                 return
             if best[1] is not None:
                 try: best[1].release()

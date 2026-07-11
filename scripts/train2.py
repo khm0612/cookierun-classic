@@ -263,7 +263,7 @@ if USE_WANDB:
 x0f, y0f, x1f, y1f = META["crop"]
 H, W, K = META["H"], META["W"], META["K"]
 imgs_all, y_all, notyet_all, run_id, run_start = [], [], [], [], []
-tr_ids, va_ids = [], []
+tr_ids, va_ids, frame_dts = [], [], []
 run_stats = []
 run_returns, run_is_self = [], []        # AWR: survival-weight each run (better runs teach more)
 offset = 0
@@ -272,6 +272,8 @@ for ri, rdir in enumerate(runs):
     frames = sorted(fm["frames"], key=lambda f: f["idx"])
     keys = json.load(open(os.path.join(rdir, "keys.json")))
     ts = np.array([f["t"] for f in frames])
+    if len(ts) > 1:
+        frame_dts.append(np.diff(ts))
     y = np.zeros(len(frames), np.int64)
     notyet = np.zeros(len(frames), bool)
     span_labeled = 0
@@ -330,6 +332,13 @@ imgs = np.concatenate(imgs_all); y = np.concatenate(y_all)
 notyet = np.concatenate(notyet_all)
 run_start = np.array(run_start); n = len(y)
 print(f"total {n} frames | train {len(tr_ids)} | val {len(va_ids)}", flush=True)
+# The K-stack gathers stride CONSECUTIVE recorded frames, so training spacing IS the recorder
+# cadence. Measure it from the demos' real timestamps and write it into meta so LearnedAgent
+# gates its live K-stack at the SAME span (fixes the 60fps-record vs 35fps-assumed drift).
+if frame_dts:
+    META["fps"] = round(1.0 / float(np.median(np.concatenate(frame_dts))), 1)
+    print(f"measured recording fps: {META['fps']}", flush=True)
+
 if wandb_run:
     dataset_metrics = {
         "dataset/frames": n,
@@ -472,7 +481,7 @@ def event_eval(conf=0.60):
             events.append((i, j, yv[i])); i = j + 1
         else: i += 1
     hits = sum(1 for a, b, c in events if np.any(fire[a:b+1] & (pred[a:b+1] == c)))
-    fam = (fire & (yv == 0)).mean() * 35 * 60   # false-fire frames/min at 35fps
+    fam = (fire & (yv == 0)).mean() * META["fps"] * 60   # false-fire frames/min at the measured fps
     return len(events), hits, fam
 
 def _augment(xb):

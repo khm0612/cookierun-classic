@@ -88,7 +88,12 @@ def _cardgame(dev, matcher, log=print, should_stop=None,
     last_ping = time.monotonic()
     while not _stop_requested(should_stop):
         f = _nav_read(dev)
-        if f is None or not matcher.present(f, "cardgame", 0.8):
+        if f is None:
+            # a capture stall (None frame) is NOT a cleared screen — declaring "cleared"
+            # here emits a false resume signal during a known capture hiccup. Keep waiting.
+            _sleep_interruptible(0.5, should_stop)
+            continue
+        if not matcher.present(f, "cardgame", 0.8):
             log(">> card game cleared — resuming.")
             return
         now = time.monotonic()

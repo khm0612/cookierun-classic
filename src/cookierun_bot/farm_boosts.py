@@ -28,6 +28,11 @@ _BOOST_TEMPLATES = ("multibtn", "pickboosts", "dblcheck", "dblrow", "multibuy", 
 # accounting; the game charges at Play, not at tap.
 _RUN_BOOST_TILES = (("tile_hp", 800), ("tile_watch", 800), ("tile_x2", 0))
 
+# x2 Point Booster runs off finite OWNED stock (no coins). When it depletes the tile can no
+# longer be checked — but it earns no coins, so it must NOT be allowed to halt the farm. HP
+# and watch are the coin-relevant boosts and stay hard-required; x2 is best-effort.
+_OPTIONAL_TILES = frozenset({"tile_x2"})
+
 
 def _watch_headstart(dev, matcher, timeout_s: float = 15.0, log=print,
                      should_stop=None) -> bool:
@@ -142,6 +147,9 @@ def ensure_run_boosts(dev, matcher, spending, log=print, should_stop=None) -> Bo
             if f is not None and _tile_checked(matcher, f, _TILE_CENTERS[name]):
                 cost += tile_cost
                 continue
+            if name in _OPTIONAL_TILES:
+                log(f"[boost] {name} not verifiable (stock depleted?); continuing best-effort")
+                continue
             log(f"[boost] {name} tile not visible after polling; skipping")
             return BoostResult(False, cost)
         if _tile_checked(matcher, f, pt):
@@ -152,6 +160,10 @@ def ensure_run_boosts(dev, matcher, spending, log=print, should_stop=None) -> Bo
         dev.tap(*pt)
         _wait_for_change(dev, f, timeout_s=1.0, should_stop=should_stop)
         if not _tile_checked_stable(dev, matcher, name, should_stop=should_stop):
+            if name in _OPTIONAL_TILES:
+                log(f"[boost] {name} still unchecked after tap (stock depleted?); "
+                    f"continuing best-effort")
+                continue
             log(f"[boost] {name} still unchecked after tap+retries")
             return BoostResult(False, cost)
         cost += tile_cost

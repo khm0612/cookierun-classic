@@ -111,9 +111,10 @@ class LearnedAgent:
         self.K, self.H, self.W = meta["K"], meta["H"], meta["W"]
         self.classes = meta["classes"]
         self._crop = meta.get("crop", [0.0, 0.0, 1.0, 1.0])
-        # stack frames at the TRAINING fps spacing: live capture may run far faster
-        # (dxcam ~270fps vs 35fps recording) and a 15ms-span stack would be
-        # out-of-distribution for a model trained on ~114ms spans.
+        # stack frames at the TRAINING fps spacing: live capture may run far faster (dxcam
+        # ~270fps) and a 15ms-span stack would be out-of-distribution. meta['fps'] is now
+        # MEASURED from the demos' real frame cadence at train time (scripts/train2.py), so
+        # it tracks the recorder instead of a stale hardcoded assumption.
         self._frame_gap = 1.0 / meta.get("fps", 35.0)
         self._last_stacked = 0.0
         self._conf = conf
@@ -135,10 +136,18 @@ class LearnedAgent:
         # frames so a self-farm run can stumble into better timings; survival then keeps the good
         # ones. 0 = pure greedy (banking). Set per-run by the farm; confident dodges stay greedy.
         self.explore = 0.0
+        # Slide gets its OWN cooldown ~= its hold duration. play_until_death re-decides per
+        # frame and each SLIDE re-issues device.hold(...slide_hold_ms) fire-and-forget, so an
+        # ungated high-conf slide at 60-270fps queues many overlapping holds = seconds of
+        # continuous LOW posture (over-slides through a platform gap = pit death) + an adb
+        # backlog. Don't re-issue a slide while the previous hold is still in flight.
+        self._slide_cd_s = getattr(getattr(cfg, "gestures", None), "slide_hold_ms", 500) / 1000.0
+        self._slide_cd_until = 0.0
 
     def reset(self) -> None:
         self._buf.clear()
         self._cd_until = 0.0
+        self._slide_cd_until = 0.0
         self._last_stacked = 0.0
 
     def _preprocess(self, frame):
@@ -194,19 +203,11 @@ class LearnedAgent:
             if now < self._cd_until:
                 return ActionDecision(ACTION_NOOP, "model:jump-cooldown")
             self._cd_until = now + self._jump_cd_s
+        elif action == ACTION_SLIDE:
+            if now < self._slide_cd_until:
+                return ActionDecision(ACTION_NOOP, "model:slide-cooldown")
+            self._slide_cd_until = now + self._slide_cd_s
         return ActionDecision(action, f"model:{cls}:{p[i]:.2f}")
 
     def act(self, frame) -> int:
         return self.decide(frame).action
-
-
-def _build_net(torch, K):
-    """v1 architecture (72x128 full-frame). Kept only so old checkpoints stay loadable."""
-    import torch.nn as nn
-    return nn.Sequential(
-        nn.Conv2d(K, 16, 5, 2, 2), nn.ReLU(),
-        nn.Conv2d(16, 32, 3, 2, 1), nn.ReLU(),
-        nn.Conv2d(32, 48, 3, 2, 1), nn.ReLU(),
-        nn.AdaptiveAvgPool2d((4, 6)),
-        nn.Flatten(), nn.Linear(48 * 4 * 6, 128), nn.ReLU(),
-        nn.Dropout(0.3), nn.Linear(128, 3))

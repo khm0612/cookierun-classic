@@ -1,3 +1,14 @@
+"""Hyperparameter sweep for the imitation model on the recorded demos (fixed data —
+squeeze the knobs). Loads + preprocesses each run ONCE at the largest resolution, then
+trains each config with best-epoch checkpointing (the last epoch is often not the best)
+and reports event-hit rate + false-fires/min on the held-out tails at several confidence
+gates. Winner is saved to data/demo/model.pt (+meta).
+
+Spacing note: frame-stack spacing is expressed through meta['fps'] — LearnedAgent stacks
+at 1/fps seconds, so a config's fps = REC_FPS/stride == stride-N over the recording with NO
+inference-code changes needed. REC_FPS is MEASURED from the demos' real timestamps (below),
+so it tracks the recorder cadence instead of a stale hardcoded rate.
+"""
 import os, json, sys, time, glob, copy
 from _runtime import DATA, ROOT
 
@@ -85,6 +96,15 @@ import gc as _gc; _gc.collect()
 print(f"total {IMGS_BIG_G.shape[0]} frames | frame bank on GPU: "
       f"{IMGS_BIG_G.element_size() * IMGS_BIG_G.nelement() / 1e6:.0f} MB VRAM, 0 in system RAM",
       flush=True)
+
+# Recording cadence is the single source of truth for frame-stack spacing: measure it from
+# the demos' real timestamps rather than assuming 35fps (the recorder now saves ~60fps). Each
+# config's meta['fps'] = REC_FPS/stride then matches its index-strided training spacing, so
+# LearnedAgent gates the live stack at the same span it trained on (no OOD drift).
+_dts = np.concatenate([np.diff(ts) for ts in TS if len(ts) > 1]) if TS else np.array([])
+if len(_dts):
+    REC_FPS = round(1.0 / float(np.median(_dts)), 1)
+    print(f"measured recording fps: {REC_FPS}", flush=True)
 
 import torch.nn.functional as _F
 _resize_cache: dict = {}
@@ -360,19 +380,29 @@ if SHARD is not None:
     print(f"\n>> SHARD {SHARD[0]}/{SHARD[1]} done — slice best {win['name']} ({win['score']:.3f}); "
           f"sweep_par.py merges + deploys", flush=True)
 else:
-    # never overwrite a better deployed model: compare against the stored winner's score
+    runset = sorted(os.path.basename(r) for r in runs)
+    # Never overwrite a better deployed model — BUT only when the comparison is valid. score
+    # depends on the demo set (val tail + event set = the last 15% of whatever demos exist), so a
+    # score from a DIFFERENT run set isn't comparable. If the demos changed (e.g. you added some —
+    # the #1 lever), deploy this round's winner instead of gating on a stale, incomparable number.
     prev_path = os.path.join(OUT, "sweep_results.json")
     prev_score = -1e9
+    prev_runset = None
     if os.path.exists(prev_path):
         prev = json.load(open(prev_path))
+        prev_runset = prev.get("runs")
         if prev.get("board"):
             prev_score = prev["board"][0].get("score", -1e9)
-    if win["score"] <= prev_score:
+    comparable = prev_runset is not None and sorted(prev_runset) == runset
+    if comparable and win["score"] <= prev_score:
         print(f"\n>> round winner {win['name']} (score {win['score']:.3f}) does NOT beat the "
-              f"deployed model (score {prev_score:.3f}) — keeping the deployed model.", flush=True)
+              f"deployed model (score {prev_score:.3f}) on the same demo set — keeping it.", flush=True)
     else:
+        if prev_runset is not None and not comparable:
+            print(f"\n>> demo set changed since last sweep (was {sorted(prev_runset)}, now "
+                  f"{runset}); scores aren't comparable — deploying this round's winner.", flush=True)
         torch.save(win["state"], os.path.join(OUT, "model.pt"))
         json.dump(win["meta"], open(os.path.join(OUT, "model_meta.json"), "w"))
-        json.dump({"winner": win["name"], "conf": win["conf"], "board": _board},
+        json.dump({"winner": win["name"], "conf": win["conf"], "runs": runset, "board": _board},
                   open(os.path.join(OUT, "sweep_results.json"), "w"), indent=1)
         print(f"\n>> WINNER {win['name']} saved to model.pt (deploy conf={win['conf']})", flush=True)
