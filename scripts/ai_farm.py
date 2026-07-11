@@ -131,6 +131,16 @@ for run_no in range(1, MAX_RUNS + 1):
     hp_hist = []; hits = []; steps = [0]; last_hit = [0.0]
     last_bt = [-9.0]              # bonustime latch: last time the banner was seen
     bt_skipped = [0]
+    # REBOUND-CONFIRM: a real hit leaves hp PERSISTENTLY lower; an overlay sweeping the
+    # HP strip (bonus washes, zone-title cards — background-dependent, so the banner
+    # template alone can't catch them all: the bright-jungle zone dropped its score
+    # below threshold and 200+ artifacts/run flooded the log) REBOUNDS within a frame
+    # or two. Hold each dip as pending and only log it if hp is still depressed 0.4s
+    # later. Detection-free and zone-independent; the 10s ring keeps the pre-dip
+    # frames intact for the dump either way.
+    pending = [None]              # {"t", "rmax", "hp"} awaiting confirmation
+    rebounds = [0]
+    _MAX_HIT_DUMPS = 60           # per-run image-dump cap (a flood once wrote ~2.8k jpgs/run)
     acts = {ACTION_NOOP: 0, ACTION_JUMP: 0, ACTION_SLIDE: 0}
 
     def _ring_img(entry):
@@ -153,40 +163,47 @@ for run_no in range(1, MAX_RUNS + 1):
         hp_hist.append((now, hp))
         while hp_hist and now - hp_hist[0][0] > 1.1: hp_hist.pop(0)
         rmax = max(h for _, h in hp_hist)
-        if rmax - hp > 0.06 and now > 4 and now - last_hit[0] > 0.6:
+        # confirm (or discard) a pending dip once 0.4s has passed
+        if pending[0] is not None and now - pending[0]["t"] >= 0.4:
+            p_t, p_rmax, p_hp = pending[0]["t"], pending[0]["rmax"], pending[0]["hp"]
+            pending[0] = None
+            if hp > p_rmax - 0.05:
+                rebounds[0] += 1               # hp bounced back => overlay artifact, not damage
+            else:
+                k = len(hits)
+                trace = [(round(t - p_t, 2), c, round(p, 2), a) for t, _, c, p, a in ring
+                         if p_t - t <= 1.5 and t <= p_t]
+                if k < _MAX_HIT_DUMPS:
+                    # dump what the model saw at decision time (~0.7s/0.3s before) + impact
+                    for tag, dt in (("pre07", 0.7), ("pre03", 0.3), ("impact", 0.0)):
+                        cand = min(ring, key=lambda r: abs((p_t - dt) - r[0]))
+                        cv2.imwrite(os.path.join(OUT, f"r{run_no:02d}_h{k:03d}_{tag}.jpg"),
+                                    _ring_img(cand), [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    # k-frames: a true K-stack at TRAINING fps spacing ending at -0.3s so
+                    # correction labels (scripts/correct.py) train with real motion context
+                    try:
+                        for ki in range(K_STACK):
+                            dt = 0.3 + (K_STACK - 1 - ki) / TRAIN_FPS
+                            cand = min(ring, key=lambda r: abs((p_t - dt) - r[0]))
+                            cv2.imwrite(os.path.join(OUT, f"r{run_no:02d}_h{k:03d}_k{ki}.jpg"),
+                                        _ring_img(cand), [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    except Exception:
+                        pass
+                rec = {"run": run_no, "hit": k, "t": round(p_t, 1),
+                       "hp": [round(p_rmax, 2), round(p_hp, 2)], "trace": trace}
+                hits.append(rec)
+                diag.write(json.dumps(rec) + "\n"); diag.flush()
+                print(f"HIT r{run_no} #{k} @ {p_t:.0f}s hp {p_rmax:.2f}->{p_hp:.2f}", flush=True)
+        if rmax - hp > 0.06 and now > 4 and now - last_hit[0] > 0.6 and pending[0] is None:
             last_hit[0] = now
             hp_hist[:] = [(now, hp)]
-            # bonus phases wash/overlay the HP strip => hp_frac drops are artifacts there,
-            # which polluted the hit log + DAgger queue (all sampled clips were bonus).
-            # 3s latch bridges the banner's fade pulse.
+            # bonus phases wash/overlay the HP strip => hp_frac drops are artifacts there.
+            # The banner latch catches the detectable ones cheaply; rebound-confirm above
+            # catches the rest (including zones where the banner template fails).
             if now - last_bt[0] < 3.0:
                 bt_skipped[0] += 1
                 return
-            k = len(hits)
-            trace = [(round(t - now, 2), c, round(p, 2), a) for t, _, c, p, a in ring
-                     if now - t <= 1.5]
-            # dump what the model saw at decision time (~0.7s and ~0.3s before) + impact
-            for tag, dt in (("pre07", 0.7), ("pre03", 0.3), ("impact", 0.0)):
-                cand = min(ring, key=lambda r: abs((now - dt) - r[0]))
-                cv2.imwrite(os.path.join(OUT, f"r{run_no:02d}_h{k:03d}_{tag}.jpg"),
-                            _ring_img(cand), [cv2.IMWRITE_JPEG_QUALITY, 85])
-            # k-frames: a true K-stack at TRAINING fps spacing ending at -0.3s so
-            # correction labels (scripts/correct.py) train with real motion context
-            # (k0 = oldest ... k{K-1} = the -0.3s labeled frame; matches train2's
-            # oldest->newest stack order)
-            try:
-                for ki in range(K_STACK):
-                    dt = 0.3 + (K_STACK - 1 - ki) / TRAIN_FPS
-                    cand = min(ring, key=lambda r: abs((now - dt) - r[0]))
-                    cv2.imwrite(os.path.join(OUT, f"r{run_no:02d}_h{k:03d}_k{ki}.jpg"),
-                                _ring_img(cand), [cv2.IMWRITE_JPEG_QUALITY, 85])
-            except Exception:
-                pass
-            rec = {"run": run_no, "hit": k, "t": round(now, 1),
-                   "hp": [round(rmax, 2), round(hp, 2)], "trace": trace}
-            hits.append(rec)
-            diag.write(json.dumps(rec) + "\n"); diag.flush()
-            print(f"HIT r{run_no} #{k} @ {now:.0f}s hp {rmax:.2f}->{hp:.2f}", flush=True)
+            pending[0] = {"t": now, "rmax": rmax, "hp": hp}
 
     dur = farm.play_until_death(dev, cfg, agent, matcher, max_s=1800, min_s=8.0,
                                 log=print, on_step=on_step)
@@ -224,7 +241,7 @@ for run_no in range(1, MAX_RUNS + 1):
         dev.stop()
         sys.exit(2)
     print(f">> RUN {run_no} OVER @ {dur:.0f}s | {len(hits)} hits ({len(hits)/max(dur/60,0.01):.1f}/min, "
-          f"{bt_skipped[0]} bonus-artifact skipped) "
+          f"{bt_skipped[0]} bonus-artifact skipped, {rebounds[0]} rebound-discarded) "
           f"| fps={fps:.0f} | jump={acts[ACTION_JUMP]} slide={acts[ACTION_SLIDE]}", flush=True)
     res = farm.read_run_result(dev, cfg, matcher)
     # audit trail: save the Result frame — a clipped OCR region misread 11,411 for what
