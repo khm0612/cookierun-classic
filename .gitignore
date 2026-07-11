@@ -15,6 +15,7 @@ templates/
 data/
 recordings/
 runs/
+wandb/
 
 # --- transient debug artifacts (screenshots produced while tuning) ---
 *.png

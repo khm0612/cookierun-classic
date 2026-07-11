@@ -8,7 +8,9 @@ regions:              # [x, y, w, h] on the CAPTURED frame — calibrate per dev
   mystery_box_counter: [500, 40, 120, 60]
   results_coins: [400, 900, 300, 80]
   results_ingredients: [400, 1000, 300, 80]
-gestures: {jump_button: [200, 1600], slide_button: [880, 1600], slide_hold_ms: 500, jump_hold_ms: 250}
+# tap_jitter_px = Gaussian scatter radius (px) around each button so taps never repeat a
+# pixel; hold_jitter_frac = +/- fraction on hold duration. Both humanize input vs bot checks.
+gestures: {jump_button: [200, 1600], slide_button: [880, 1600], slide_hold_ms: 500, jump_hold_ms: 250, tap_jitter_px: 55, hold_jitter_frac: 0.15}
 reward: {w_coin: 1.0, w_box: 50.0, w_survive: 0.01, death_penalty: 10.0}
 spending:
   # Turn on only when you want the target-video behavior: spend coins on pre-run boosts.

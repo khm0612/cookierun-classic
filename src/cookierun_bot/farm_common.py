@@ -4,14 +4,22 @@ template polling, result-screen reading, and the boost-gate dataclasses.
 Leaf module — imported by farm_cards, farm_boosts, and farm; imports nothing from them."""
 from __future__ import annotations
 from dataclasses import dataclass
+import os
 import time
 
 import numpy as np
 
 from .detect import read_results, read_int
 
+# ABSOLUTE path to monitor.py's `card_active` flag (this file is src/cookierun_bot/farm_common.py,
+# so three parents up == repo root). Anchored to __file__ NOT cwd so the card-BACK veto works no
+# matter where the farm is launched from — a cwd-relative read silently no-ops under any non-root
+# launch (adversarial review, 2026-07-05).
+_CARD_FLAG = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                          "data", "_selffarm", "card_active")
+
 __all__ = [
-    "_nav_read", "_diff", "_snapshot", "_stop_requested", "_sleep_interruptible",
+    "_nav_read", "_boost_read_fast", "_diff", "_snapshot", "_stop_requested", "_sleep_interruptible",
     "_sleep_remaining", "_wait_for_change", "wait_for_result_frame", "read_run_result",
     "read_wallet",
     "_scrolling", "_in_run", "_tap_template", "_visible_safe_action", "_safe_to_back",
@@ -83,6 +91,23 @@ def _nav_read(dev):
         except Exception:
             pass
     return dev.last_frame()
+
+
+def _boost_read_fast(dev):
+    """A FAST frame (dxcam last_frame, ~3ms) for boost-gate BADGE + button verification. The
+    sharp adb nav grab is ~880ms; the green-check badge (tilecheck) and the Multi buttons score
+    within ~0.02 of it on the fast frame (validated live on the boost screen), so the common
+    'tiles already checked' path needs no adb screencap. Falls back to the sharp read if no fast
+    frame is available. Decisions that need a below-0.80 ICON match still use the sharp _nav_read."""
+    lf = getattr(dev, "last_frame", None)
+    if lf is not None:
+        try:
+            f = lf()
+            if f is not None:
+                return f
+        except Exception:
+            pass
+    return _nav_read(dev)
 
 
 def _diff(a, b) -> float:
@@ -259,7 +284,16 @@ def _safe_to_back(dev, matcher) -> bool:
     kill the game (observed live: flaky adb capture returned garbage frames that matched
     NOTHING → 'unrecognized' → BACK → BACK → quit). Only allow BACK when we can POSITIVELY
     confirm a dismissable modal: a fresh, valid, non-blank frame where Play is NOT visible.
-    A capture failure (None / near-uniform) or any Play match vetoes BACK — we wait instead."""
+    A capture failure (None / near-uniform) or any Play match vetoes BACK — we wait instead.
+    Also veto while monitor.py is solving a card game (it drops a fresh `card_active` flag):
+    the card screen is NOT a dismissable popup — BACK can forfeit it and walk out of the app
+    entirely (observed 2026-07-05: a template-missed 'sliding card' got BACK-spammed to the
+    Android launcher). The flag is ignored after 90s so a dead monitor can't freeze nav."""
+    try:
+        if time.time() - os.stat(_CARD_FLAG).st_mtime < 90:
+            return False                               # card game in progress -> never BACK
+    except OSError:
+        pass                                           # no flag -> normal popup handling
     fresh = _nav_read(dev)
     if fresh is None or float(np.std(fresh)) < 12.0:
         return False                                   # blank/stale/broken capture -> never BACK
@@ -274,6 +308,8 @@ def _tile_checked(matcher, frame, pt) -> bool:
     cx, cy = pt
     h, w = frame.shape[:2]
     roi = frame[max(0, cy - 40):min(h, cy + 200), max(0, cx - 40):min(w, cx + 240)]
+    if roi.size == 0:            # pt falls outside this frame (e.g. a partial / wrong-size capture)
+        return False             # -> not "checked"; the caller falls back to the sharp-adb path
     return matcher.present(roi, "tilecheck", 0.80)
 
 

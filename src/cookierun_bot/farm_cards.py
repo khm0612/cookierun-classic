@@ -26,33 +26,36 @@ def _alert_user() -> None:
 
 
 def _card_pair(frame):
-    """Return (i, j, margin) of the answer pair. USER RULE (refined on a live round
-    2026-07-04): FOUR of the six cards show one identical decoy pose; the answer is the
-    pose that exists as exactly a PAIR. Raw pixel diffs cannot separate the groups
-    (animated sparkles + small sprites), but the sprite's SHAPE can: mask the sprite
-    against the card's uniform background and use its bbox aspect (a sliding pose is
-    wide/low ~0.73; upright ~1.05 — measured live, cards 2&6 vs 1/3/4/5). The two cards
-    whose aspect deviates most from the median are the pair. Crop is LEFT-biased because
-    the gingerbread mascot can occlude a right-column card's right edge. margin = gap
-    between the 2nd and 3rd largest deviations (small = ambiguous round)."""
+    """Return (i, j, margin) of the answer pair. USER-CONFIRMED structure (2026-07-05): the board
+    is 4 IDENTICAL decoy cards + 2 IDENTICAL answer cards (same picture within each group). So the
+    2 answers are near-identical to EACH OTHER and different from the 4 decoys -> they have the
+    LOWEST average PICTURE similarity to the group. We compute pairwise normalized cross-correlation
+    on the card crops and pick the 2 lowest-avg-similarity cards; margin = how cleanly those 2
+    separate from the 4-decoy cluster. Feed a TEMPORAL-MEDIAN frame (monitor.median_grab) so the
+    animated sparkles don't corrupt the match — that was the documented reason raw pixels failed.
+    Crop is LEFT-biased because the gingerbread mascot occludes a right-column card's right edge.
+
+    (Superseded the bbox-ASPECT heuristic: aspect throws away the picture and can't separate subtle
+    same-aspect poses; on de-animated boards pairwise similarity is a far stronger signal, and it
+    agreed with the old solver on 13/15 of its confident boards even on animated data.)"""
     import cv2
-    devs = []
-    aspects = []
+    crops = []
     for cx, cy in _CARD_CENTERS:
-        c = frame[cy - 170:cy + 170, cx - 135:cx + 60]
-        bg = np.median(c.reshape(-1, 3), axis=0)
-        dist = np.abs(c.astype(int) - bg).sum(2)
-        m = (dist > 60).astype(np.uint8)
-        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        ys, xs = np.nonzero(m)
-        if len(ys) < 20:
-            aspects.append(1.0)
-            continue
-        aspects.append((ys.max() - ys.min()) / max(xs.max() - xs.min(), 1))
-    a = np.array(aspects)
-    dev = np.abs(a - np.median(a))
-    order = np.argsort(-dev)
-    margin = float((dev[order[1]] - dev[order[2]]) * 10)   # ~aspect gap, scaled
+        c = frame[cy - 185:cy + 185, cx - 158:cx + 78]
+        g = cv2.cvtColor(c, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        g = cv2.resize(g, (72, 108))
+        g = cv2.GaussianBlur(g, (3, 3), 0)                 # robust to sub-pixel sprite jitter
+        g -= g.mean()
+        crops.append(g / (float(np.linalg.norm(g)) + 1e-6))  # unit-norm zero-mean -> dot == NCC
+    n = len(crops)
+    S = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                S[i][j] = float((crops[i] * crops[j]).sum())
+    avg = S.sum(1) / (n - 1)                                # mean similarity to the other 5 cards
+    order = np.argsort(avg)                                 # ascending: 2 answers (lowest) first
+    margin = float((avg[order[2]] - avg[order[1]]) * 20)    # gap: 2-answer cluster -> 4-decoy cluster
     return int(order[0]), int(order[1]), margin
 
 

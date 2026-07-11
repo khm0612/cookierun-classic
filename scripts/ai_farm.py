@@ -19,6 +19,12 @@ OUT = str(DATA / "ai_hits")
 os.makedirs(OUT, exist_ok=True)
 MAX_RUNS = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 ACT = {ACTION_NOOP: "none", ACTION_JUMP: "jump", ACTION_SLIDE: "slide"}
+# Resolution of the diagnostic hit/death clips (the frames correct.py shows for labeling).
+# 960x540 matches the demo recorder's 960-wide frames + is crisp to label. The DECISION-time
+# ring holds ~160 of these (2.5s @ 60fps), so RAM ~= W*H*3*160: 960x540 ~= 250MB. This is
+# ONLY for human labeling — the model always trains/infers on a 96x224 grayscale crop, so the
+# clip resolution has ZERO effect on model performance. (1920x1080 works too but ~1GB ring.)
+CLIP_WH = (960, 540)
 
 def hp_frac(f):
     strip = f[125:158, 240:820]
@@ -111,7 +117,7 @@ for run_no in range(1, MAX_RUNS + 1):
         parts = decision.reason.split(":")
         cls = parts[1] if len(parts) > 1 else "?"
         prob = float(parts[2]) if len(parts) > 2 else 0.0
-        small = cv2.resize(f, (640, 360))
+        small = cv2.resize(f, CLIP_WH)
         ring.append((now, small, cls, prob, ACT.get(decision.action, "?")))
         hp = hp_frac(f)
         hp_hist.append((now, hp))

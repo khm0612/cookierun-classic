@@ -7,7 +7,7 @@ import numpy as np
 
 from .detect import read_int
 from .farm_common import (
-    _nav_read, _sleep_interruptible, _stop_requested, _wait_for_change,
+    _nav_read, _boost_read_fast, _sleep_interruptible, _stop_requested, _wait_for_change,
     _tap_template, _find_stable, _tile_checked, _tile_checked_stable,
     BoostResult, BoostTileStatus, BoostGateStatus,
 )
@@ -45,7 +45,10 @@ def _watch_headstart(dev, matcher, timeout_s: float = 15.0, log=print,
         if f is None:
             continue
         pt = matcher.find(f, "headstart", 0.60)
-        if pt is not None and abs(pt[0] - 1220) < 400 and abs(pt[1] - 690) < 260:
+        # y-gate TIGHTENED to <130 (was 260): the run-start prompt rests at y~687-737, but the
+        # loose gate also matched the bottom-HUD ⏩ boost icon at y~869 and tapped THAT (dead tap =
+        # Head Start never activated, observed live). <130 keeps the real prompt, excludes the HUD icon.
+        if pt is not None and abs(pt[0] - 1220) < 400 and abs(pt[1] - 690) < 130:
             if prev is not None and abs(pt[0] - prev[0]) < 20 and abs(pt[1] - prev[1]) < 20:
                 dev.tap(*pt)
                 time.sleep(0.25)
@@ -120,6 +123,17 @@ def ensure_run_boosts(dev, matcher, spending, log=print, should_stop=None) -> Bo
     per-run coin cost of the priced tiles that end up checked."""
     cost = 0
     for name, tile_cost in _RUN_BOOST_TILES:
+        # FAST PATH (the common case): the three checks PERSIST across runs, so each tile is almost
+        # always ALREADY checked. Verify the green-check BADGE at the tile's fixed grid centre FIRST,
+        # on a fast (~3ms dxcam) frame — it's capture-robust (~0.99) and needs NO icon match. This
+        # skips the doomed 8-poll icon search: the tile_watch/tile_x2 ICON templates have rotted
+        # below 0.80, so _find_stable burned ~7s per tile before falling back to this same badge
+        # (measured: ~19s for an all-checked gate). Any tile whose badge isn't confirmed here still
+        # drops to the full sharp-adb check + enable-tap below, so nothing is weakened.
+        ff = _boost_read_fast(dev)
+        if ff is not None and _tile_checked(matcher, ff, _TILE_CENTERS[name]):
+            cost += tile_cost
+            continue
         pt, f = _find_stable(dev, matcher, name, 0.80, should_stop=should_stop)
         if pt is None:
             # Icon templates rot with tile state (stock count / price art) — but the gate
@@ -177,8 +191,8 @@ def buy_double_coins(dev, matcher, spending, log=print,
     deadline = time.monotonic() + _BUY_POLL_CEILING_S
     rolled = False                                     # latch: Multi-Buy tapped once, never again
     while time.monotonic() < deadline and not _stop_requested(should_stop):
-        f = _nav_read(dev)
-        if f is None:
+        f = _boost_read_fast(dev)                      # ~3ms dxcam: banner/dialog/buttons score ~0.99
+        if f is None:                                  # on it; the single-tap latch guards double-spend
             _sleep_interruptible(0.3, should_stop)
             continue
         if matcher.present(f, "dblbanner", 0.80):

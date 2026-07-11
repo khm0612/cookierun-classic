@@ -89,6 +89,16 @@ python scripts/train2.py          # trains on ALL data/demo* recordings, 30 epoc
 - Saves `data/demo/model.pt` + `data/demo/model_meta.json` (architecture/crop/fps live in
   meta so training and inference can never drift).
 - Reports held-out event hit-rate + false-fires/min per run.
+- Architecture options:
+  - `python scripts/mobilenet_v3_large.py` → saves `data/demo/mobilenet_v3_large.pt`
+    + `data/demo/mobilenet_v3_large_meta.json`.
+  - `python scripts/efficientnet_b5.py` → saves `data/demo/efficientnet_b5.pt`
+    + `data/demo/efficientnet_b5_meta.json`.
+  - `python scripts/train2.py --arch small` → original tiny CNN baseline.
+- W&B logging:
+  - `python scripts/mobilenet_v3_large.py --runs demo2,demo3,demo4 --wandb`
+  - Optional naming: `--wandb-project cookierun-bot --wandb-name mobile-demo234`
+  - Logs dataset summary, epoch metrics, final confusion table, and a model artifact.
 
 **Step 2.5 — DAgger corrections (the biggest lever without recording new demos):**
 
@@ -174,7 +184,7 @@ then it auto-continues. (The bot logs a heuristic guess as a hint but never taps
 | Symptom | Fix |
 |---|---|
 | `fps=0` / `BLIND RUN` in the log | Capture went stale after an emulator/window hiccup. The child exits and the **supervisor relaunches** clean. If using `ai_farm.py` directly, just re-run it. |
-| Stuck spamming `unrecognized … sending BACK` | Usually a flaky adb moment. The `_safe_to_back` guard prevents BACK from ever quitting the game; if adb is truly offline, run `adb connect 127.0.0.1:5555`. |
+| Stuck spamming `unrecognized … sending BACK` | Usually a card game whose template nav missed (or a flaky adb moment). `_safe_to_back` now also vetoes BACK while `monitor.py` is solving a card (via the `data/_selffarm/card_active` flag), and self_farm's `_game_foreground()` relaunches the game if BACK still walked it out to the LDPlayer launcher. If it's genuinely stuck: relaunch with `adb -s 127.0.0.1:5555 shell am start -n com.devsisters.crg/com.devsisters.CookieRunForKakao.OvenbreakX`, solve any pending card (tap the 2 matching cards), and the farm re-navs from the menu. If adb is offline, `adb connect 127.0.0.1:5555`. |
 | Boost gate stuck on `tile_x2 missing` | Tile icon art drifts with stock/price; the badge-fallback handles it. If it persists, re-crop `templates/tile_x2.png` to the tile **icon only** (top ~62%, no price strip). |
 | `device offline` / black screencap | `adb disconnect 127.0.0.1:5555 && adb connect 127.0.0.1:5555`; relaunch the game if needed. |
 | Coins read as 0 or wrong | OCR miss on the Result screen; the audit frame is saved to `data/ai_hits/result_rNN.jpg`. The counted total is a floor — the in-game balance is the truth. |

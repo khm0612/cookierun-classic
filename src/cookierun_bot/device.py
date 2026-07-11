@@ -410,6 +410,19 @@ class AdbDevice:
         if not self._send(line):
             self._dev.shell(line)
 
+    def press(self, x: int, y: int) -> None:
+        # true touch-DOWN: the finger stays down until release() — variable-length slides.
+        # Instant command (no duration), so it never queues backlog in the shell pipe the
+        # way a long `input swipe` does. Verified on the LDPlayer Android 14 image.
+        line = f"input motionevent DOWN {int(x)} {int(y)}"
+        if not self._send(line):
+            self._dev.shell(line)
+
+    def release(self, x: int, y: int) -> None:
+        line = f"input motionevent UP {int(x)} {int(y)}"
+        if not self._send(line):
+            self._dev.shell(line)
+
     def back(self) -> None:
         # BACK dismisses tap-deaf restored modals (acts as OK/close); keyevents always
         # register even when touch injection is being swallowed.
@@ -836,6 +849,14 @@ class LDPlayerDevice:
     def hold(self, x: int, y: int, duration_ms: int) -> None:
         ax, ay = self._scale_tap(x, y)
         self._adb.hold(ax, ay, duration_ms)
+
+    def press(self, x: int, y: int) -> None:
+        ax, ay = self._scale_tap(x, y)
+        self._adb.press(ax, ay)
+
+    def release(self, x: int, y: int) -> None:
+        ax, ay = self._scale_tap(x, y)
+        self._adb.release(ax, ay)
 
     def back(self) -> None:
         self._adb.back()

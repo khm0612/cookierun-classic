@@ -13,8 +13,8 @@ never contends with the running bot. Three jobs:
        * re-checks `cardgame` present on the SAME frame it acts on, every round,
        * taps each pair-card exactly ONCE/round, waits ~4s, re-checks (no spamming),
        * taps ONLY the 6 known card centers, ONLY while cardgame is present,
-       * on a LOW-confidence board it still taps its best guess — a wrong pick just wins a
-         lesser prize and 3 tries/round absorb it; stalling the marathon for hours is worse.
+       * on a LOW-confidence board it DOES NOT TAP; it keeps the farm paused and waits for
+         manual resolution. Wrong card taps cost more than pausing.
      Every board it sees is saved to data/ai_hits/ for offline heuristic tuning.
   2. ADB RECOVERY — repeated screencap failures trigger `adb reconnect` (device-offline has
      stalled unattended runs before).
@@ -51,11 +51,30 @@ OUT_DIR = str(DATA / "ai_hits")
 SUP_LOG = str(ROOT / "supervisor.log")
 SUP_SCRIPT = str(ROOT / "scripts" / "supervisor.py")
 POLL_S = 3.0
-CARD_THRESH = 0.85          # detection (arming) threshold -- high, to avoid false positives
-CARD_THRESH_ACT = 0.80      # per-round recheck threshold while solving
-MARGIN_OK = 3.0             # >= this = confident; below = flagged as a guess (still tapped)
+CARD_THRESH = float(os.environ.get("MONITOR_CARD_THRESH", "0.85"))
+# per-round recheck threshold while solving
+CARD_THRESH_ACT = float(os.environ.get("MONITOR_CARD_THRESH_ACT", "0.80"))
+# >= this = confident tap; below = low-confidence
+MARGIN_OK = float(os.environ.get("MONITOR_MARGIN_OK", "3.0"))
 GRAB_FAILS_BEFORE_RECONNECT = 3
 MAX_SUP_RELAUNCH = 3        # bounded so a truly-broken emulator can't loop forever
+
+# While we're solving a card, drop a flag so farm.py's nav (which sometimes fails to match the
+# card template on its dxcam frame) never sends BACK on the card screen — a stray BACK can forfeit
+# the card and walk the app out to the Android launcher (observed 2026-07-05, 'sliding card' wedge).
+_CARD_FLAG = str(DATA / "_selffarm" / "card_active")
+def _set_card_flag() -> None:
+    try:
+        os.makedirs(os.path.dirname(_CARD_FLAG), exist_ok=True)
+        with open(_CARD_FLAG, "w") as fh:
+            fh.write("1")                              # content unused; the FRESH mtime is the signal
+    except OSError:
+        pass
+def _clear_card_flag() -> None:
+    try:
+        os.remove(_CARD_FLAG)
+    except OSError:
+        pass
 
 # supervise-mode shared state (updated by the supervisor pump thread, read by the watch loop)
 _sup = {"target": 0, "done": 0, "finished": False, "proc": None}
@@ -64,6 +83,14 @@ _STOP = threading.Event()   # set on monitor shutdown so the pump won't relaunch
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _alert_user() -> None:
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+    except Exception:
+        pass
 
 
 def _adb(*args, timeout=15):
@@ -95,6 +122,23 @@ def grab():
     return None
 
 
+def median_grab(n: int = 5, gap: float = 0.10):
+    """Grab n frames and return the pixel-wise MEDIAN — DE-ANIMATES the card sprites (the shimmer/
+    sparkles are transient, the pose is static), giving the pose heuristic a clean, noise-free frame.
+    The documented root cause of low-confidence rounds is 'sprites are animated'; this removes it."""
+    fr = []
+    for _ in range(n):
+        g = grab()
+        if g is not None:
+            fr.append(g)
+        time.sleep(gap)
+    if not fr:
+        return None
+    if len(fr) == 1:
+        return fr[0]
+    return np.median(np.stack(fr), axis=0).astype(np.uint8)
+
+
 def tap(x, y) -> None:
     try:
         _adb("shell", "input", "tap", str(int(x)), str(int(y)), timeout=10)
@@ -103,17 +147,43 @@ def tap(x, y) -> None:
 
 
 def save_card(frame, rnd) -> None:
-    """Audit every card board so the aspect heuristic can be tuned offline on real data."""
+    """Audit every card board (FULL 2560x1440 res) so the solver can be tuned/learned offline on
+    real data — half-res JPGs blur the subtle pose difference that separates the answer pair."""
     try:
         os.makedirs(OUT_DIR, exist_ok=True)
         path = os.path.join(OUT_DIR, f"cardgame_mon_{int(time.time())}_{rnd}.jpg")
-        cv2.imwrite(path, cv2.resize(frame, (1280, 720)), [cv2.IMWRITE_JPEG_QUALITY, 85])
+        cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
     except Exception:
         pass
 
 
+def _wait_for_manual_card_clear(matcher: TemplateMatcher) -> None:
+    """Hold the farm on a low-confidence card board until the user clears it."""
+    last_ping = 0.0
+    while True:
+        _set_card_flag()
+        f = grab()
+        if f is None:
+            time.sleep(1.0)
+            continue
+        if not matcher.present(f, "cardgame", CARD_THRESH_ACT):
+            _clear_card_flag()
+            log("low-confidence card cleared manually -- run resuming")
+            return
+        now = time.monotonic()
+        if now - last_ping > 20.0:
+            last_ping = now
+            _alert_user()
+            log("LOW-confidence card still up -- waiting; no card taps will be made")
+        time.sleep(1.0)
+
+
 def solve_cardgame(matcher: TemplateMatcher) -> None:
-    """Solve rounds until the cardgame template is gone (or a safety cap is hit)."""
+    """Solve rounds until the cardgame template is gone (or a safety cap is hit).
+
+    High-confidence boards are tapped once per round. Low-confidence boards are fail-closed:
+    keep the farm paused and wait for manual resolution instead of gambling wrong cards.
+    """
     for rnd in range(1, 7):                       # a normal game is <=3 rounds; cap generously
         f = grab()
         if f is None:
@@ -121,18 +191,57 @@ def solve_cardgame(matcher: TemplateMatcher) -> None:
             continue
         if not matcher.present(f, "cardgame", CARD_THRESH_ACT):
             log("card game gone -- solved/closed; run resuming")
+            _clear_card_flag()                     # card gone -> let nav resume normal BACK handling
             return
+        # A real card game is a full-screen overlay with NO menu Play button. If Play IS visible we
+        # mis-detected the menu / Friends leaderboard as a card -> NEVER restart or tap: restarting
+        # force-stops the game and spawns unrecognized transition screens that nav BACK-spams out to
+        # the launcher (the observed 2026-07-05 "keeps exiting the game" wedge). Stand down instead.
+        if matcher.present(f, "play", 0.72):
+            log("menu Play visible -- NOT a real card game (mis-detect); standing down, no restart/tap")
+            _clear_card_flag()
+            return
+        _set_card_flag()                           # card present -> nav must NOT BACK this screen
+        f = median_grab()                          # de-animated frame (sparkles removed) for solving
+        if f is None:
+            continue
         save_card(f, rnd)
         i, j, margin = _card_pair(f)
+        if margin < MARGIN_OK:
+            log(f"round {rnd}: margin {margin:.1f} < {MARGIN_OK} = low confidence -- STANDING DOWN "
+                f"(heuristic guess cards {i + 1} & {j + 1}); waiting for manual solve")
+            _wait_for_manual_card_clear(matcher)
+            return
         ci, cj = _CARD_CENTERS[i], _CARD_CENTERS[j]
-        tag = "OK" if margin >= MARGIN_OK else "LOW-guess"
-        log(f"round {rnd}: pair = cards {i + 1} & {j + 1} (margin {margin:.1f} {tag}) "
+        log(f"round {rnd}: pair = cards {i + 1} & {j + 1} (margin {margin:.1f} OK) "
             f"-> tap {ci} then {cj}")
         tap(*ci)
         time.sleep(0.6)
         tap(*cj)
         time.sleep(4.0)                            # user rule: don't hurry, wait ~4s / round
+    _clear_card_flag()                             # gave up -> don't freeze nav on a stuck flag
     log("card solve: hit round cap -- leaving it; the run continues regardless")
+
+
+def dismiss_modal(matcher, template: str, confirm_xy, label: str) -> None:
+    """Tap the known Confirm on a BENIGN blocking popup that nav's dxcam template misses (e.g. the
+    weekly 'League Results' screen, which nav BACK-spammed into a wedge 2026-07-05). This is
+    BANNER-GATED — we only tap `confirm_xy` while `template` (a distinctive, spend-free banner) is
+    confirmed present, so we can NEVER tap a purchase/crystal-spend dialog. Drops card_active while
+    dismissing so nav stands down instead of BACK-spamming."""
+    log(f"{label} popup detected -- dismissing via Confirm {confirm_xy} (banner-gated, no spend)")
+    _set_card_flag()
+    try:
+        for _ in range(4):                         # a couple taps in case the first misses / re-shows
+            tap(*confirm_xy)
+            time.sleep(2.0)
+            g = grab()
+            if g is None or not matcher.present(g, template, 0.85):
+                log(f"{label} dismissed -- run resuming")
+                return
+        log(f"{label} still present after 4 taps -- leaving it")
+    finally:
+        _clear_card_flag()
 
 
 def _kill_stray_farm() -> None:
@@ -225,7 +334,10 @@ def test(path: str) -> None:
     log(f"frame {f.shape} | cardgame present(>= {CARD_THRESH}) = {present}")
     i, j, margin = _card_pair(f)
     log(f"_card_pair -> cards {i + 1} & {j + 1}  (0-based {i},{j})  margin={margin:.2f}")
-    log(f"would tap: {_CARD_CENTERS[i]} then {_CARD_CENTERS[j]}")
+    if margin < MARGIN_OK:
+        log(f"would STAND DOWN: margin {margin:.2f} < {MARGIN_OK}")
+    else:
+        log(f"would tap: {_CARD_CENTERS[i]} then {_CARD_CENTERS[j]}")
 
 
 def main(supervise_target: "int | None" = None) -> None:
@@ -256,15 +368,24 @@ def main(supervise_target: "int | None" = None) -> None:
                 time.sleep(POLL_S)
                 continue
             grab_fails = 0
-            if matcher.present(f, "cardgame", CARD_THRESH):
+            if matcher.present(f, "cardgame", CARD_THRESH) and not matcher.present(f, "play", 0.72):
+                _set_card_flag()                   # card seen -> veto nav BACK NOW, before the
+                                                   # 2-poll settle gate (closes the cold-start race
+                                                   # where nav could BACK a just-appeared card).
+                                                   # Play-veto: never arm on a menu/leaderboard frame.
                 seen += 1
                 if seen >= 2:                      # settle gate: 2 consecutive detections
                     log("CARD GAME detected (settled) -- taking over")
                     solve_cardgame(matcher)
                     seen = 0
                     hb = time.monotonic()
+            elif matcher.present(f, "league_results", 0.85):
+                dismiss_modal(matcher, "league_results", (1280, 1210), "LEAGUE RESULTS")
+                seen = 0
+                hb = time.monotonic()
             else:
                 seen = 0
+                _clear_card_flag()                 # no card in view -> release the BACK veto
             if time.monotonic() - hb > 120:
                 hb = time.monotonic()
                 extra = f" | farm {_sup['done']}/{_sup['target']}" if supervise_target else ""

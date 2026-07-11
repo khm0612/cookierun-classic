@@ -88,3 +88,18 @@ def test_read_mystery_boxes_zero_on_unreadable():
                 "results_ingredients": Region(0, 0, 50, 50),
                 "play_area": Region(0, 0, 50, 50)})
     assert read_mystery_boxes(frame, cfg) == 0     # blank -> 0, never crashes
+
+
+def test_digit_boxes_splits_touching_digits_instead_of_dropping_them():
+    """Regression: a bold comma-grouped balance renders leading digits (e.g. '43' in
+    438,651) as ONE tall+wide connected component. The old round-icon filter dropped it,
+    truncating the number (438,651 -> 8651; the ~20% result-screen misreads). It must be
+    SPLIT into its digits instead."""
+    crop = np.zeros((80, 210, 3), np.uint8)
+    cv2.rectangle(crop, (46, 25), (46 + 49, 25 + 31), (255, 255, 255), -1)   # merged "43" (w=49)
+    for x, w in [(98, 21), (131, 24), (157, 21), (181, 11)]:                 # singles 8,6,5,1
+        cv2.rectangle(crop, (x, 25), (x + w, 25 + 30), (255, 255, 255), -1)
+    boxes = detect._digit_boxes(crop)
+    assert len(boxes) == 6, f"wide blob was not split into 2: {boxes}"       # 2 split + 4 singles
+    xs = sorted(x for x, _, _, _ in boxes)
+    assert xs[0] < 60 and 60 <= xs[1] < 96                                   # two halves of the merged blob

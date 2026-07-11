@@ -23,7 +23,27 @@ class Gestures:
     jump_button: tuple[int, int]
     slide_button: tuple[int, int]
     slide_hold_ms: int
-    jump_hold_ms: int = 250     # held press = higher/longer jump than a tap
+    jump_hold_ms: int = 250       # held press = higher/longer jump than a tap
+    # Anti-detection input humanization (0 = off, deterministic). Production configs enable
+    # these so the bot never taps the same pixel / holds the same exact ms twice.
+    tap_jitter_px: int = 0        # Gaussian scatter radius around the button centre (px)
+    hold_jitter_frac: float = 0.0  # +/- fraction jitter on hold duration (e.g. 0.15 = +/-15%)
+    # Slide/jump timing (tunable). A slide is a press-and-hold: it stays down while the model
+    # predicts slide, plus `slide_grace_s` after it stops, and for at least `slide_min_hold_s`
+    # total once started. Defaults are R3's PROVEN values (grace 0.20, NO min-hold, jump cd 0.25):
+    # a live A/B showed a 0.45s min-hold DEGRADED R3 (97s/3k vs 318s/99k) — it forced R3's occasional
+    # MISTIMED slides to last 0.45s -> sliding through pits -> early death. Raise slide_min_hold only
+    # for a model that under-holds correct slides, never a model that slides at the wrong time.
+    slide_grace_s: float = 0.40
+    slide_min_hold_s: float = 1.5     # user: once it slides, HOLD >= 1.5s — a jump does NOT cut it
+                                      # short inside this window (see SlideHold.protecting / farm loop)
+    jump_cooldown_s: float = 0.25
+    # Min softmax prob for the model to SLIDE. Slides are CHEAP in principle (a wrong slide doesn't
+    # directly kill), BUT live A/B (2026-07-06) showed lowering this on R3 to 0.60 DEGRADED survival
+    # to ~90s (vs proven 318s): R3's LOW-confidence slides are UNRELIABLE (wrong slides) and a held
+    # slide BLOCKS the one-finger jump -> it slides when it should jump. So R3's proven value is the
+    # strict 0.90. A retrained model with a RELIABLE slide head could safely slide at a low gate.
+    slide_conf: float = 0.35
 
 
 @dataclass(frozen=True)
@@ -124,7 +144,13 @@ def load_config(path: str = "config.yaml") -> Config:
             regions=regions,
             gestures=Gestures(tuple(g["jump_button"]), tuple(g["slide_button"]),
                               int(g["slide_hold_ms"]),
-                              jump_hold_ms=int(g.get("jump_hold_ms", 250))),
+                              jump_hold_ms=int(g.get("jump_hold_ms", 250)),
+                              tap_jitter_px=int(g.get("tap_jitter_px", 0)),
+                              hold_jitter_frac=float(g.get("hold_jitter_frac", 0.0)),
+                              slide_grace_s=float(g.get("slide_grace_s", 0.40)),
+                              slide_min_hold_s=float(g.get("slide_min_hold_s", 1.5)),
+                              jump_cooldown_s=float(g.get("jump_cooldown_s", 0.25)),
+                              slide_conf=float(g.get("slide_conf", 0.35))),
             reward=RewardWeights(float(rw["w_coin"]), float(rw["w_box"]),
                                  float(rw["w_survive"]), float(rw["death_penalty"])),
             menu_allowlist=list(menu["allowlist"]),

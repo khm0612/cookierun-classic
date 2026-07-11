@@ -23,8 +23,17 @@ cfg = load_config(str(CONFIG))
 cfg = farm._auto_serial_config(cfg, log=print)
 dev = open_device(cfg); dev.start()
 matcher = TemplateMatcher(cfg.templates_dir)
-agent = LearnedAgent(cfg, str(REC / "model.pt"), str(REC / "model_meta.json"), conf=0.6)
-print("backend:", type(dev).__name__, "| model on:", agent._device, flush=True)
+import json as _json
+_conf = 0.6
+_sr = REC / "sweep_results.json"
+if _sr.exists():
+    _conf = _json.load(open(_sr)).get("conf", 0.6)
+if len(sys.argv) > 1:                    # optional conf override: learned_check.py 0.5
+    _conf = float(sys.argv[1])
+agent = LearnedAgent(cfg, str(REC / "model.pt"), str(REC / "model_meta.json"), conf=_conf)
+_meta = _json.load(open(REC / "model_meta.json"))
+print(f"backend: {type(dev).__name__} | model on: {agent._device} | "
+      f"res {_meta['H']}x{_meta['W']} | deploy conf {_conf}", flush=True)
 serial = cfg.device_serial
 def tap(x, y): subprocess.run(["adb", "-s", serial, "shell", "input", "touchscreen", "swipe",
                                str(x), str(y), str(x), str(y), "70"], timeout=10)
@@ -34,7 +43,8 @@ def tap(x, y): subprocess.run(["adb", "-s", serial, "shell", "input", "touchscre
 # on sharp adb frames via _nav_read/nav_frame and refuses to Play un-boosted.
 print(">> navigating to a run (boost gate + Double Coins)...", flush=True)
 cycle = {}
-if not farm.ensure_running(dev, matcher, cfg, log=print, cycle=cycle):
+if not farm.ensure_running(dev, matcher, cfg, log=print, cycle=cycle,
+                           gift_state={"depleted": True}):     # skip the buggy gift-draw branch
     print("!! could not reach a run", flush=True); dev.stop(); raise SystemExit
 print(f">> boost spend this cycle: {cycle}", flush=True)
 print(">> RUN DETECTED — learned agent driving", flush=True)

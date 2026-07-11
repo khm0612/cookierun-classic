@@ -19,10 +19,60 @@ from .rule_based import ActionDecision
 _ACTION = {"none": ACTION_NOOP, "jump": ACTION_JUMP, "slide": ACTION_SLIDE}
 
 
+def _replace_first_conv(nn, module, in_ch: int) -> None:
+    for name, child in module.named_children():
+        if isinstance(child, nn.Conv2d):
+            setattr(module, name, nn.Conv2d(
+                in_ch, child.out_channels, child.kernel_size, child.stride, child.padding,
+                child.dilation, child.groups, child.bias is not None, child.padding_mode))
+            return
+        try:
+            _replace_first_conv(nn, child, in_ch)
+            return
+        except LookupError:
+            pass
+    raise LookupError("no Conv2d layer found")
+
+
+def _torchvision_model(model_name: str, num_classes: int):
+    try:
+        from torchvision import models
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            f"{model_name} requires torchvision. Install it with "
+            "`python -m pip install torchvision`."
+        ) from exc
+    return getattr(models, model_name)(weights=None, num_classes=num_classes)
+
+
+def _build_mobilenet_v3_large(torch, meta):
+    import torch.nn as nn
+    net = _torchvision_model("mobilenet_v3_large", len(meta["classes"]))
+    _replace_first_conv(nn, net.features, int(meta["K"]))
+    return net
+
+
+def _build_efficientnet_b5(torch, meta):
+    import torch.nn as nn
+    net = _torchvision_model("efficientnet_b5", len(meta["classes"]))
+    _replace_first_conv(nn, net.features, int(meta["K"]))
+    return net
+
+
 def build_net_from_meta(torch, meta):
-    """Conv stack from meta['conv'] = [(out_ch, kernel, stride), ...] on K stacked grayscale
-    frames, flattened WITH spatial layout preserved (no global pooling — obstacle POSITION
-    is the signal), then fc -> 3 classes. Shared by train2.py and LearnedAgent."""
+    """Build the architecture named in model_meta.json. Missing arch keeps old checkpoints
+    on the original small CNN."""
+    arch = meta.get("arch", "small_cnn")
+    if arch == "mobilenet_v3_large":
+        return _build_mobilenet_v3_large(torch, meta)
+    if arch == "efficientnet_b5":
+        return _build_efficientnet_b5(torch, meta)
+    if arch not in ("small_cnn", "cnn", "conv"):
+        raise ValueError(f"unknown learned model arch: {arch}")
+
+    # Conv stack from meta['conv'] = [(out_ch, kernel, stride), ...] on K stacked grayscale
+    # frames, flattened WITH spatial layout preserved (no global pooling — obstacle POSITION
+    # is the signal), then fc -> 3 classes. Shared by train2.py and LearnedAgent.
     import torch.nn as nn
     layers, in_ch = [], meta["K"]
     h, w = meta["H"], meta["W"]
@@ -39,16 +89,22 @@ class LearnedAgent:
     """CNN behavioral-cloning policy. `conf` = minimum softmax probability to act (below it
     -> NOOP): trades a few missed dodges for far fewer spurious ones.
 
-    `conf_slide` is much stricter: the two mistakes are NOT symmetric. A wrong jump just
-    lands back (worst case an HP hit that potions heal); a wrong slide keeps the cookie LOW
-    through a platform gap = pit death (observed live: the model mistook a jump-onto ledge
-    for a slide-under obstacle and slid into the pit). With only 29 slide examples in the
-    demo the slide head is the least-trusted output, so it must be near-certain to act."""
+    `conf_slide` = the slide-specific gate. USER CORRECTION (2026-07-06): sliding is CHEAP — a
+    wrong/low-confidence slide does NOT kill the cookie. The only cost of over-sliding is that a
+    held slide BLOCKS the one-finger jump, so spamming slide can miss a needed jump; a single
+    well-placed slide is free. So conf_slide is now LOW (from cfg.gestures.slide_conf, default
+    0.60) — the model should DUCK READILY — not the old near-certain 0.90 that (wrongly) assumed
+    a mistaken slide caused a pit death. Pass conf_slide explicitly to override the config."""
 
     def __init__(self, cfg, model_path: str, meta_path: str, conf: float = 0.6,
-                 conf_slide: float = 0.90):
-        import torch
+                 conf_slide: float | None = None):
+        import torch, os
         self._torch = torch
+        # Allow forcing GPU-only mode via env var: set FORCE_CUDA=1 to require CUDA and fail otherwise.
+        force_cuda = os.environ.get("FORCE_CUDA", os.environ.get("CUDA_ONLY", "0"))
+        force_cuda = str(force_cuda).lower() in ("1", "true", "yes")
+        if force_cuda and not torch.cuda.is_available():
+            raise RuntimeError("FORCE_CUDA is set but no CUDA device is available. Aborting to avoid CPU fallback.")
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         meta = json.load(open(meta_path))
         self.meta = meta
@@ -61,7 +117,8 @@ class LearnedAgent:
         self._frame_gap = 1.0 / meta.get("fps", 35.0)
         self._last_stacked = 0.0
         self._conf = conf
-        self._conf_slide = conf_slide
+        self._conf_slide = conf_slide if conf_slide is not None else \
+            getattr(getattr(cfg, "gestures", None), "slide_conf", 0.60)
         self._buf: deque = deque(maxlen=self.K)
         self._net = build_net_from_meta(torch, meta)
         self._net.load_state_dict(torch.load(model_path, map_location="cpu"))
@@ -70,8 +127,14 @@ class LearnedAgent:
         # purpose: the human demo double-jumps with gaps down to ~0.12s (p5 0.20s), so a
         # long cooldown blocks half their real dodge pattern; the device's one-finger
         # throttle already absorbs per-frame refires of the same decision.
-        self._jump_cd_s = 0.25
+        # TIME-based jump cooldown (config-tunable). Bigger = fewer, slower jumps (the user asked
+        # to "slow down the jump a bit"). Small enough to still allow the human's fast double-jumps.
+        self._jump_cd_s = getattr(getattr(cfg, "gestures", None), "jump_cooldown_s", 0.30)
         self._cd_until = 0.0
+        # EXPLORATION (self-improvement, no labels): >0 samples non-greedy actions at UNCERTAIN
+        # frames so a self-farm run can stumble into better timings; survival then keeps the good
+        # ones. 0 = pure greedy (banking). Set per-run by the farm; confident dodges stay greedy.
+        self.explore = 0.0
 
     def reset(self) -> None:
         self._buf.clear()
@@ -101,12 +164,32 @@ class LearnedAgent:
         with self._torch.no_grad():
             p = self._torch.softmax(self._net(x)[0], 0).cpu().numpy()
         i = int(p.argmax())
+        # EXPLORE only where the policy is UNSURE (top prob < 0.85): sample the action from p and
+        # COMMIT to it (bypass the conf gate) so the alternative is actually tried. Confident dodges
+        # (>=0.85) are never randomised, so exploration can't blow up a clear obstacle response.
+        explored = False
+        if self.explore > 0.0 and float(p.max()) < 0.85 and np.random.random() < self.explore:
+            i = int(np.random.choice(len(p), p=p))
+            explored = True
         cls = self.classes[i]
         action = _ACTION[cls]
+        now = time.monotonic()
+        if explored:
+            if action == ACTION_NOOP:
+                return ActionDecision(ACTION_NOOP, f"explore:none:{p[i]:.2f}")
+            if action == ACTION_SLIDE and p[i] < self._conf_slide:
+                # a wrong SLIDE keeps the cookie low through a platform gap = un-tankable pit death
+                # (asymmetric vs jump, which just lands back). Never GAMBLE a slide while exploring —
+                # exploration only tries jump/none timings (recoverable errors).
+                return ActionDecision(ACTION_NOOP, f"explore:slide-gated:{p[i]:.2f}")
+            if action == ACTION_JUMP:
+                if now < self._cd_until:
+                    return ActionDecision(ACTION_NOOP, "explore:jump-cooldown")
+                self._cd_until = now + self._jump_cd_s
+            return ActionDecision(action, f"explore:{cls}:{p[i]:.2f}")
         gate = self._conf_slide if action == ACTION_SLIDE else self._conf
         if action == ACTION_NOOP or p[i] < gate:
             return ActionDecision(ACTION_NOOP, f"model:{cls}:{p[i]:.2f}")
-        now = time.monotonic()
         if action == ACTION_JUMP:
             if now < self._cd_until:
                 return ActionDecision(ACTION_NOOP, "model:jump-cooldown")

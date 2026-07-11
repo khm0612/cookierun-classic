@@ -495,7 +495,7 @@ def test_ensure_running_does_not_play_without_double_coin_banner(monkeypatch):
         "_tap_template",
         lambda dev, matcher, name, thresh=0.72: play_taps.append(name) or True,
     )
-    dev = FakeDevice([np.zeros((4, 4, 3), np.uint8)])
+    dev = FakeDevice([np.zeros((400, 500, 3), np.uint8)])   # big enough for the tile-badge ROI at pt
     logs = []
     cycle = {}
 
@@ -527,7 +527,7 @@ def test_ensure_running_does_not_play_without_required_three_boosts(monkeypatch)
         "_tap_template",
         lambda dev, matcher, name, thresh=0.72: play_taps.append(name) or True,
     )
-    dev = FakeDevice([np.zeros((4, 4, 3), np.uint8)])
+    dev = FakeDevice([np.zeros((400, 500, 3), np.uint8)])   # big enough for the tile-badge ROI at pt
     logs = []
     cycle = {}
 
@@ -639,7 +639,9 @@ def test_ensure_run_boosts_taps_unchecked_tile_once_then_verifies(monkeypatch):
     monkeypatch.setattr(farm, "_wait_for_change", lambda *a, **k: None)
     unchecked = np.full((400, 400, 3), 0, np.uint8)
     checked = np.full((400, 400, 3), 1, np.uint8)
-    dev = FakeDevice([unchecked, checked])  # first tile seen unchecked -> tap -> re-verify
+    # badge-first fast read + the sharp _find_stable read both see the CURRENT (unchecked) screen,
+    # then the post-tap re-verify sees checked (two unchecked frames: one per read before the tap).
+    dev = FakeDevice([unchecked, unchecked, checked])
     dev.taps = []
     dev.tap = lambda x, y: dev.taps.append((x, y))
 

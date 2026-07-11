@@ -102,15 +102,27 @@ def _load_digit_templates(templates_dir: str) -> dict[str, tuple[np.ndarray, ...
 def _digit_boxes(crop) -> list[tuple[int, int, int, int]]:
     mask = _digit_mask(crop)
     num, _, stats, _ = cv2.connectedComponentsWithStats(mask)
-    boxes = []
     min_h = max(14, int(crop.shape[0] * 0.35))
+    singles, wide = [], []
     for i in range(1, num):
         x, y, w, h, area = [int(v) for v in stats[i]]
         if h < min_h or area < 40:
             continue
-        if w / max(h, 1) > 1.15:       # skip round icons; digits are narrower
-            continue
-        boxes.append((x, y, w, h))
+        if w / max(h, 1) > 1.15:
+            # A TALL but wide blob is almost always TOUCHING DIGITS (bold comma-grouped
+            # balances render e.g. "43" as one component), NOT a round icon (icons are
+            # ~square, w/h<=1.15). The old code DROPPED these -> silently truncated leading
+            # digits (438,651 read as 8651; the ~20% result "0"/misreads). Split instead.
+            wide.append((x, y, w, h))
+        else:
+            singles.append((x, y, w, h))
+    # reference single-digit width, to infer how many digits a wide blob holds
+    ref_w = int(np.median([w for _, _, w, _ in singles])) if singles else max(1, int(min_h * 0.62))
+    boxes = list(singles)
+    for x, y, w, h in wide:
+        n = max(2, int(round(w / max(ref_w, 1))))     # e.g. 49px / 24px -> 2 digits
+        step = w / n
+        boxes += [(int(x + k * step), y, int(round(step)), h) for k in range(n)]
     return sorted(boxes)
 
 

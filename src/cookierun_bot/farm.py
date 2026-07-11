@@ -18,7 +18,7 @@ from .config import CAPTURE_BACKENDS, ConfigError, load_config
 from .detect import TemplateMatcher, read_int, read_results
 from .device import open_device, select_adb_serial
 from .gift_draw import GIFT_TEMPLATES, draw_gifts, gift_button_visible
-from .gestures import ACTION_JUMP, ACTION_NOOP, ACTION_SLIDE, apply_action
+from .gestures import ACTION_JUMP, ACTION_NOOP, ACTION_SLIDE, SlideHold, apply_action
 from .metrics import Metrics, RunResult
 from .policies.rule_based import ActionDecision, StreamingRuleBasedAgent
 
@@ -285,7 +285,22 @@ def play_until_death(dev, cfg, agent, matcher=None, max_s: float = 3600.0,
     On a stall, if a MENU/popup button (Play/OK/Confirm) is visible we are NOT in a run
     (e.g. a false start left us on the menu) — stop immediately rather than centre-tapping,
     which on the menu lands on the League leaderboard and opens Friend's Cookie popups."""
+    slide_ctl = SlideHold(grace_s=getattr(cfg.gestures, "slide_grace_s", 0.30),
+                          min_hold_s=getattr(cfg.gestures, "slide_min_hold_s", 0.45))
+    try:
+        return _run_loop(dev, cfg, agent, matcher, max_s, min_s, should_stop, log,
+                         on_step, slide_ctl)
+    finally:
+        # NEVER leak a held finger past the run: a dangling touch-DOWN would perma-slide
+        # the next run and confuse every menu tap in between. force_ (not plain release)
+        # so a lost/rejected UP earlier — which already cleared `held` — is still lifted.
+        slide_ctl.force_release(dev, cfg.gestures)
+
+
+def _run_loop(dev, cfg, agent, matcher, max_s, min_s, should_stop, log,
+              on_step, slide_ctl) -> float:
     agent.reset()
+    slide_ctl.force_release(dev, cfg.gestures)   # clear any finger orphaned by a crashed run
     prev = None
     still = 0
     stall_taps = 0
@@ -338,7 +353,9 @@ def play_until_death(dev, cfg, agent, matcher=None, max_s: float = 3600.0,
                 # prompt is UP; the button always comes to rest at (1220, 687), so wait
                 # a beat for the animation and tap the rest position itself.
                 pt = matcher.find(f, "headstart", 0.60)
-                if pt is not None and abs(pt[0] - 1220) < 400 and abs(pt[1] - 690) < 260:
+                # y-gate <130 (was 260): excludes the bottom-HUD ⏩ boost icon (~y869) that the loose
+                # gate false-matched + dead-tapped; the real run-start prompt rests at y~687-737.
+                if pt is not None and abs(pt[0] - 1220) < 400 and abs(pt[1] - 690) < 130:
                     # STABLE-POINT tap: taps at the historical rest point (1220,687)
                     # and blanket bursts there all failed — today's matches settle at
                     # ~(1290-1345, 700-737), i.e. the button (and its hitbox) moved.
@@ -346,6 +363,7 @@ def play_until_death(dev, cfg, agent, matcher=None, max_s: float = 3600.0,
                     # within 20px the button has stopped animating — tap THERE.
                     if hs_prev and abs(pt[0] - hs_prev[0]) < 20 and abs(pt[1] - hs_prev[1]) < 20:
                         log(f"[run] Head Start settled at {pt} — tapping it")
+                        slide_ctl.release(dev, cfg.gestures)   # one finger: lift slide first
                         dev.tap(*pt)
                         time.sleep(0.35)
                         dev.tap(*pt)
@@ -362,6 +380,7 @@ def play_until_death(dev, cfg, agent, matcher=None, max_s: float = 3600.0,
             # measure <=0.39, so 0.60 keeps washed-but-present HUDs in-run.)
             if hud_missing == 0.0:
                 hud_missing = time.monotonic()
+            slide_ctl.release(dev, cfg.gestures)   # inputs suppressed => lift the finger
             if menu_up:
                 break                       # Result / menu is up => the run truly ended
             if time.monotonic() - hud_missing >= 30.0:
@@ -374,12 +393,21 @@ def play_until_death(dev, cfg, agent, matcher=None, max_s: float = 3600.0,
         if decision.action != ACTION_NOOP:
             now = time.monotonic()
             # streaming mode re-decides per frame (60fps+): log a repeated action at
-            # most twice a second — the device's one-finger throttle drops the extras
+            # most twice a second
             if decision.reason != last_action_reason or now - last_action_log >= 0.5:
                 log(f"[action] {_ACTION_NAMES.get(decision.action, decision.action)} "
                     f"reason={decision.reason} confirmed={decision.confirmed}")
                 last_action_reason, last_action_log = decision.reason, now
-        apply_action(dev, decision.action, cfg.gestures)
+        # SLIDE is a stateful press-and-hold (SlideHold): DOWN on the first slide
+        # prediction, held while the model keeps predicting, UP when it stops — this is
+        # what the span-labelled training expresses. It ALSO kills the old input-queue
+        # backlog: per-tick `input swipe ... 500` re-fires stacked seconds of queued
+        # gestures in the adb shell (LDPlayer has no scrcpy-style one-finger throttle).
+        slide_ctl.update(dev, cfg.gestures, decision.action == ACTION_SLIDE)
+        if decision.action == ACTION_JUMP:
+            if slide_ctl.held:
+                slide_ctl.release(dev, cfg.gestures)   # one finger: end slide, then jump
+            apply_action(dev, decision.action, cfg.gestures)
         if on_step is not None:               # observer hook (diagnostics): never mutates
             on_step(time.monotonic() - t0, f, decision)
         snap = _snapshot(f)
@@ -390,6 +418,7 @@ def play_until_death(dev, cfg, agent, matcher=None, max_s: float = 3600.0,
                         matcher.find(f, n, 0.82) for n in ("play", "ok", "confirm2")):
                     break                       # a menu/popup is up => not a run => stop
                 if stall_taps < 4:              # try to clear a boost prompt / continue
+                    slide_ctl.release(dev, cfg.gestures)   # one finger: lift slide first
                     dev.tap(*_STALL_TAP)
                     stall_taps += 1
                     still = 0
