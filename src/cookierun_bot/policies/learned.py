@@ -59,6 +59,53 @@ def _build_efficientnet_b5(torch, meta):
     return net
 
 
+def build_convs(nn, meta):
+    """The conv trunk shared by small_cnn, FilmCNN and the SSL pretrainer (scripts/
+    pretrain_encoder.py): Sequential of Conv2d+ReLU from meta['conv'] with the SAME layer
+    indexing as the small_cnn prefix, so a pretrained encoder state_dict loads 1:1 into
+    any of them. Returns (convs, out_channels, out_h, out_w)."""
+    layers, in_ch = [], meta["K"]
+    h, w = meta["H"], meta["W"]
+    for out_ch, k, s in meta["conv"]:
+        layers += [nn.Conv2d(in_ch, out_ch, k, s, k // 2), nn.ReLU()]
+        in_ch = out_ch
+        h, w = (h + s - 1) // s, (w + s - 1) // s
+    return nn.Sequential(*layers), in_ch, h, w
+
+
+def _build_film_cnn(torch, meta):
+    """small_cnn trunk + FiLM conditioning on [t, speed, bonus] (see condition.py). The
+    cond vector modulates the last conv feature map per-channel (gamma/beta, ZERO-init so
+    an untrained FiLM is an exact identity = stable fine-tune from a pretrained encoder)
+    and is also embedded + concatenated into the fc input."""
+    import torch.nn as nn
+    cond_dim = len(meta.get("cond", {}).get("dims", ["t", "speed", "bonus"]))
+    convs, c, h, w = build_convs(nn, meta)
+    fc_dim, n_cls = meta["fc"], len(meta["classes"])
+
+    class FilmCNN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.convs = convs
+            self.film = nn.Sequential(nn.Linear(cond_dim, 32), nn.ReLU(),
+                                      nn.Linear(32, 2 * c))
+            self.cond_emb = nn.Sequential(nn.Linear(cond_dim, 16), nn.ReLU())
+            self.fc = nn.Linear(c * h * w + 16, fc_dim)
+            self.drop = nn.Dropout(0.3)
+            self.head = nn.Linear(fc_dim, n_cls)
+            nn.init.zeros_(self.film[-1].weight)
+            nn.init.zeros_(self.film[-1].bias)
+
+        def forward(self, x, cond):
+            hh = self.convs(x)
+            g, b = self.film(cond).chunk(2, dim=-1)
+            hh = hh * (1.0 + g[:, :, None, None]) + b[:, :, None, None]
+            z = torch.cat([hh.flatten(1), self.cond_emb(cond)], dim=1)
+            return self.head(self.drop(torch.relu(self.fc(z))))
+
+    return FilmCNN()
+
+
 def build_net_from_meta(torch, meta):
     """Build the architecture named in model_meta.json. Missing arch keeps old checkpoints
     on the original small CNN."""
@@ -67,6 +114,8 @@ def build_net_from_meta(torch, meta):
         return _build_mobilenet_v3_large(torch, meta)
     if arch == "efficientnet_b5":
         return _build_efficientnet_b5(torch, meta)
+    if arch == "small_cnn_film":
+        return _build_film_cnn(torch, meta)
     if arch not in ("small_cnn", "cnn", "conv"):
         raise ValueError(f"unknown learned model arch: {arch}")
 
@@ -74,12 +123,8 @@ def build_net_from_meta(torch, meta):
     # frames, flattened WITH spatial layout preserved (no global pooling — obstacle POSITION
     # is the signal), then fc -> 3 classes. Shared by train2.py and LearnedAgent.
     import torch.nn as nn
-    layers, in_ch = [], meta["K"]
-    h, w = meta["H"], meta["W"]
-    for out_ch, k, s in meta["conv"]:
-        layers += [nn.Conv2d(in_ch, out_ch, k, s, k // 2), nn.ReLU()]
-        in_ch = out_ch
-        h, w = (h + s - 1) // s, (w + s - 1) // s
+    convs, in_ch, h, w = build_convs(nn, meta)
+    layers = list(convs)
     layers += [nn.Flatten(), nn.Linear(in_ch * h * w, meta["fc"]), nn.ReLU(),
                nn.Dropout(0.3), nn.Linear(meta["fc"], len(meta["classes"]))]
     return nn.Sequential(*layers)
@@ -121,6 +166,22 @@ class LearnedAgent:
         self._conf_slide = conf_slide if conf_slide is not None else \
             getattr(getattr(cfg, "gestures", None), "slide_conf", 0.60)
         self._buf: deque = deque(maxlen=self.K)
+        # FiLM conditioning (arch small_cnn_film): meta["cond"] carries the normalisation
+        # constants; the agent computes the SAME [t, speed, bonus] vector live that
+        # scripts/train2.py computed offline from the demos. Self-contained: the BONUSTIME
+        # banner is checked here (throttled), so ai_farm/self_farm/farm all get it for
+        # free. The template is machine-local — absent => bonus soft-off at 0.
+        self._cond_meta = meta.get("cond") if meta.get("arch") == "small_cnn_film" else None
+        if self._cond_meta:
+            from .condition import CondTracker, bonustime_bgr, load_bonus_template
+            self._bonustime_bgr = bonustime_bgr
+            self._cond = CondTracker(
+                t_norm_s=self._cond_meta.get("t_norm_s", 600.0),
+                speed_norm=self._cond_meta.get("speed_norm", 1.0),
+                bonus_latch_s=self._cond_meta.get("bonus_latch_s", 3.0))
+            self._bt_tpl = load_bonus_template(getattr(cfg, "templates_dir", "templates"))
+            self._bt_check_s = 0.25
+            self._bt_last = 0.0
         self._net = build_net_from_meta(torch, meta)
         self._net.load_state_dict(torch.load(model_path, map_location="cpu"))
         self._net.to(self._device).eval()
@@ -149,6 +210,8 @@ class LearnedAgent:
         self._cd_until = 0.0
         self._slide_cd_until = 0.0
         self._last_stacked = 0.0
+        if self._cond_meta:
+            self._cond.reset()
 
     def _preprocess(self, frame):
         h, w = frame.shape[:2]
@@ -160,7 +223,11 @@ class LearnedAgent:
     def _stack(self, frame):
         now = time.monotonic()
         if not self._buf or now - self._last_stacked >= self._frame_gap:
-            self._buf.append(self._preprocess(frame).astype(np.float32) / 255.0)
+            new = self._preprocess(frame).astype(np.float32) / 255.0
+            if self._cond_meta and self._buf:
+                # one speed sample per NEW slot = the offline per-recorded-frame cadence
+                self._cond.on_slot(self._buf[-1], new, now - self._last_stacked)
+            self._buf.append(new)
             self._last_stacked = now
         else:                                   # too soon: refresh only the newest slot
             self._buf[-1] = self._preprocess(frame).astype(np.float32) / 255.0
@@ -170,8 +237,18 @@ class LearnedAgent:
 
     def decide(self, frame) -> ActionDecision:
         x = self._torch.from_numpy(self._stack(frame)).to(self._device)
-        with self._torch.no_grad():
-            p = self._torch.softmax(self._net(x)[0], 0).cpu().numpy()
+        if self._cond_meta:
+            tnow = time.monotonic()
+            if tnow - self._bt_last >= self._bt_check_s:   # throttled banner check
+                self._bt_last = tnow
+                if self._bonustime_bgr(frame, self._bt_tpl):
+                    self._cond.bonus_seen(tnow)
+            cond_t = self._torch.from_numpy(self._cond.vector(tnow)[None]).to(self._device)
+            with self._torch.no_grad():
+                p = self._torch.softmax(self._net(x, cond_t)[0], 0).cpu().numpy()
+        else:
+            with self._torch.no_grad():
+                p = self._torch.softmax(self._net(x)[0], 0).cpu().numpy()
         i = int(p.argmax())
         # EXPLORE only where the policy is UNSURE (top prob < 0.85): sample the action from p and
         # COMMIT to it (bypass the conf gate) so the alternative is actually tried. Confident dodges

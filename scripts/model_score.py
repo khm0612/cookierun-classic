@@ -90,16 +90,17 @@ def _label_run(ts, keys, win_pre, win_post):
 _VAL_CACHE = {}
 
 
-def _load_val(rdir, H, W, crop, K, stride, win_pre, win_post):
+def _load_val(rdir, H, W, crop, K, stride, win_pre, win_post, film_tpl=None):
     """Decode + preprocess ONLY the val-tail frames a K-stack references ([cut-(K-1)*stride .. N)),
-    cached by (demo, geometry). Returns (imgs, va, y, start, N) or None if the run has no val
-    frames. The 85% training region is never touched — this is what keeps the promotion gate
+    cached by (demo, geometry). Returns (imgs, va, y, start, N, ts, bt_raw) or None if the run
+    has no val frames; bt_raw (per-window BONUSTIME banner hits) is None unless film_tpl is
+    given. The 85% training region is never touched — this is what keeps the promotion gate
     affordable inline (demo4 is 65k frames; decoding all of them each retrain would stall the farm)."""
     import os
     import json
     import cv2
 
-    key = (rdir, H, W, tuple(crop), K, stride, win_pre, win_post)
+    key = (rdir, H, W, tuple(crop), K, stride, win_pre, win_post, film_tpl is not None)
     if key in _VAL_CACHE:
         return _VAL_CACHE[key]
     fj = os.path.join(rdir, "frames.json")
@@ -118,15 +119,19 @@ def _load_val(rdir, H, W, crop, K, stride, win_pre, win_post):
     x0f, y0f, x1f, y1f = crop
     start = max(0, cut - (K - 1) * stride)
     imgs = np.zeros((N - start, H, W), np.uint8)
+    bt_raw = np.zeros(N - start, bool) if film_tpl is not None else None
     fdir = os.path.join(rdir, "frames")
     for i in range(start, N):
         im = cv2.imread(os.path.join(fdir, f"{frames[i]['idx']:06d}.jpg"), cv2.IMREAD_GRAYSCALE)
         if im is None:
             continue
+        if film_tpl is not None:
+            from cookierun_bot.policies import condition
+            bt_raw[i - start] = condition.bonustime_gray(im, film_tpl)
         h, w = im.shape
         band = im[int(h * y0f):int(h * y1f), int(w * x0f):int(w * x1f)]
         imgs[i - start] = cv2.resize(band, (W, H), interpolation=cv2.INTER_AREA)
-    out = (imgs, va, y, start, N)
+    out = (imgs, va, y, start, N, ts, bt_raw)
     _VAL_CACHE[key] = out
     return out
 
@@ -158,14 +163,35 @@ def score_model(model_path, meta_path, eval_demos=None, data_dir=None, device=No
     net.load_state_dict(torch.load(model_path, map_location="cpu"))
     net.to(dev).eval()
 
+    # film models also take the [t, speed, bonus] cond vector — built here from the SAME
+    # helpers train2 used, so gate scores stay train-faithful.
+    cond_meta = meta.get("cond") if meta.get("arch") == "small_cnn_film" else None
+    film_tpl = None
+    if cond_meta:
+        from cookierun_bot.policies import condition
+        from _runtime import ROOT
+        film_tpl = condition.load_bonus_template(str(ROOT / "templates"))
+
     crop = [x0f, y0f, x1f, y1f]
     ks = np.arange(K - 1, -1, -1)
     all_yv, all_pred, all_prob = [], [], []
     for name in demos:
-        loaded = _load_val(os.path.join(data_dir, name), H, W, crop, K, stride, win_pre, win_post)
+        loaded = _load_val(os.path.join(data_dir, name), H, W, crop, K, stride, win_pre,
+                           win_post, film_tpl=film_tpl if cond_meta else None)
         if loaded is None:
             continue
-        imgs, va, y, start, N = loaded
+        imgs, va, y, start, N, ts, bt_raw = loaded
+        cond_va_t = None
+        if cond_meta:
+            ts_win = ts[start:]
+            speeds = condition.run_speeds(ts_win, imgs)      # EMA warm-up inside the window:
+            blatch = condition.latch_bonus(                  # a few frames of settling, all
+                ts_win, bt_raw, cond_meta.get("bonus_latch_s", 3.0))   # before the val cut
+            cw = np.zeros((len(imgs), 3), np.float32)
+            cw[:, 0] = np.clip((ts_win - ts[0]) / cond_meta.get("t_norm_s", 600.0), 0.0, 1.0)
+            cw[:, 1] = np.clip(speeds / max(cond_meta.get("speed_norm") or 1.0, 1e-6), 0.0, 2.0)
+            cw[:, 2] = blatch
+            cond_va_t = torch.from_numpy(cw[va - start]).to(dev)
         # rebased val-frame K-stack indices, clamped to the loaded window's first frame (matches
         # sweep's np.maximum(..., run_start) and LearnedAgent's oldest-frame padding; only bites
         # for tiny runs where cut < (K-1)*stride — a no-op for the real demos).
@@ -176,7 +202,8 @@ def score_model(model_path, meta_path, eval_demos=None, data_dir=None, device=No
         with torch.no_grad():
             for b in range(0, len(va), 512):
                 xb = imgs_t[idx_t[b:b + 512]].float().div_(255.0)
-                p = torch.softmax(net(xb), 1).cpu().numpy()
+                out = net(xb, cond_va_t[b:b + 512]) if cond_meta else net(xb)
+                p = torch.softmax(out, 1).cpu().numpy()
                 preds.append(p.argmax(1)); probs.append(p.max(1))
         all_yv.append(y[va])
         all_pred.append(np.concatenate(preds))

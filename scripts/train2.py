@@ -1,8 +1,9 @@
 import os, json, sys, time, glob
-from _runtime import DATA
+from _runtime import DATA, ROOT
 import numpy as np, cv2
 import torch, torch.nn as nn
 from cookierun_bot.policies.learned import build_net_from_meta
+from cookierun_bot.policies import condition
 
 BASE = str(DATA)
 OUT = os.path.join(BASE, "demo")               # model.pt destination (LearnedAgent path)
@@ -21,8 +22,11 @@ _ARCH_ALIASES = {
     "efficientnet_b5": "efficientnet_b5",
     "small": "small_cnn",
     "small_cnn": "small_cnn",
+    "film": "small_cnn_film",
+    "small_cnn_film": "small_cnn_film",
 }
 ARCH = "small_cnn"
+ARCH_SET = False             # whether --arch was passed explicitly (else --meta-from inherits it)
 OUT_PREFIX = "model"
 RUN_NAMES = None
 USE_WANDB = "--wandb" in sys.argv[1:]
@@ -37,6 +41,7 @@ META_FROM = None             # --meta-from PATH: inherit K/H/W/crop/fps/win_pre/
 for i, arg in enumerate(sys.argv[1:]):
     if arg == "--arch" and i + 2 < len(sys.argv):
         ARCH = _ARCH_ALIASES.get(sys.argv[i + 2], sys.argv[i + 2])
+        ARCH_SET = True
     elif arg == "--k" and i + 2 < len(sys.argv):
         K_OVERRIDE = int(sys.argv[i + 2])
     elif arg.startswith("--k="):
@@ -63,6 +68,7 @@ for i, arg in enumerate(sys.argv[1:]):
         WANDB_MODE = sys.argv[i + 2]
     elif arg.startswith("--arch="):
         ARCH = _ARCH_ALIASES.get(arg.split("=", 1)[1], arg.split("=", 1)[1])
+        ARCH_SET = True
     elif arg.startswith("--out-prefix="):
         OUT_PREFIX = arg.split("=", 1)[1]
     elif arg.startswith("--runs="):
@@ -77,6 +83,7 @@ for i, arg in enumerate(sys.argv[1:]):
         WANDB_MODE = arg.split("=", 1)[1]
     elif arg in _ARCH_ALIASES:
         ARCH = _ARCH_ALIASES[arg]
+        ARCH_SET = True
 torch.manual_seed(0)
 
 META = {
@@ -96,14 +103,32 @@ META = {
 if META_FROM and os.path.exists(META_FROM):
     _base = json.load(open(META_FROM))
     for _k in ("K", "H", "W", "crop", "fps", "conv", "fc",
-               "win_pre", "win_post", "notyet_lo", "notyet_hi", "notyet_w"):
+               "win_pre", "win_post", "notyet_lo", "notyet_hi", "notyet_w", "cond"):
         if _k in _base:
             META[_k] = _base[_k]
-    print(f"meta-from {META_FROM}: K{META['K']} fps{META['fps']} win_pre{META['win_pre']}", flush=True)
+    if not ARCH_SET and "arch" in _base:      # a retrain of a film model must stay film
+        ARCH = _ARCH_ALIASES.get(_base["arch"], _base["arch"])
+        META["arch"] = ARCH
+    print(f"meta-from {META_FROM}: K{META['K']} fps{META['fps']} win_pre{META['win_pre']} "
+          f"arch {ARCH}", flush=True)
 if K_OVERRIDE:
     META["K"] = K_OVERRIDE
 if CROP_OVERRIDE:
     META["crop"] = CROP_OVERRIDE
+
+# FiLM conditioning (arch small_cnn_film): the model additionally takes [t, speed, bonus]
+# per frame (see policies/condition.py). speed_norm is calibrated below (encoder meta or
+# corpus p90) and written into meta so LearnedAgent normalises live exactly like training.
+FILM = ARCH == "small_cnn_film"
+if FILM and "cond" not in META:
+    META["cond"] = {"dims": list(condition.COND_DIMS), "t_norm_s": condition.T_NORM_S,
+                    "speed_norm": None, "bonus_latch_s": condition.BONUS_LATCH_S}
+if not FILM:
+    META.pop("cond", None)                    # a non-film arch must not carry cond meta
+BT_TPL = condition.load_bonus_template(str(ROOT / "templates")) if FILM else None
+if FILM and BT_TPL is None:
+    print("WARNING: templates/bonustime_norm.png missing — bonus cond dim will be all-0",
+          flush=True)
 
 # --- no-labeling training improvements (all use signals we already have) ---
 # (death-discount was tried + dropped: the per-run 85/15 split already holds the fatal last 15%
@@ -137,6 +162,25 @@ NEG_LAMBDA = float(_farg("--neg-lambda", 0.5))
 #   "jump": label them JUMP (positive CE) — targets pits + counters the slide-bias directly.
 NEG_MODE = _farg("--neg-mode", "unlikelihood")
 NEG_JUMP_W = float(_farg("--neg-jump-w", 0.3))    # weight of the jump-correction loss in "jump" mode
+# SSL encoder transfer (scripts/pretrain_encoder.py): load pretrained conv weights, and
+# optionally freeze them ("--freeze-enc all" or first-N conv layers) so the thin demos
+# only train the head. --save-best keeps the best eval-epoch weights instead of the last
+# epoch (the sweep proved last-epoch saves overfit).
+ENCODER_INIT = _farg("--encoder-init", None)
+FREEZE_ENC = _farg("--freeze-enc", None)
+SAVE_BEST = "--save-best" in sys.argv[1:]
+_ENC = None
+if ENCODER_INIT:
+    if not os.path.exists(ENCODER_INIT):
+        raise SystemExit(f"--encoder-init {ENCODER_INIT} not found")
+    _ENC = torch.load(ENCODER_INIT, map_location="cpu")
+    _em = _ENC["meta"]
+    for _k in ("K", "H", "W", "conv", "crop"):
+        if _em.get(_k) != META.get(_k):
+            raise SystemExit(f"encoder/model geometry mismatch on '{_k}': "
+                             f"{_em.get(_k)} vs {META.get(_k)}")
+if FILM and NEG_NPZ:
+    raise SystemExit("--neg-npz is not supported with the film arch")
 # --slide-span-cap: cap how much of a slide HOLD is labeled "slide". The full hold (default 3.0)
 # labels every crouched frame as slide -> the model learns "crouched cookie -> slide" -> a live
 # SLIDE-LOCK (once it slides it sees itself crouched and keeps sliding, never jumps pits). A short
@@ -266,6 +310,7 @@ imgs_all, y_all, notyet_all, run_id, run_start = [], [], [], [], []
 tr_ids, va_ids, frame_dts = [], [], []
 run_stats = []
 run_returns, run_is_self = [], []        # AWR: survival-weight each run (better runs teach more)
+cond_parts = []                          # film: per-run (ts, raw speeds, latched bonus)
 offset = 0
 for ri, rdir in enumerate(runs):
     fm = json.load(open(os.path.join(rdir, "frames.json")))
@@ -301,14 +346,23 @@ for ri, rdir in enumerate(runs):
           f"not-yet {int(notyet.sum())}, span-slides {span_labeled}", flush=True)
     t0 = time.time()
     imgs = np.zeros((len(frames), H, W), np.uint8)
+    bt_raw = np.zeros(len(frames), bool)
     fdir = os.path.join(rdir, "frames")
     for i, fr in enumerate(frames):
         im = cv2.imread(os.path.join(fdir, f"{fr['idx']:06d}.jpg"), cv2.IMREAD_GRAYSCALE)
         if im is None: continue
+        if FILM:                               # banner lives ABOVE the model crop band
+            bt_raw[i] = condition.bonustime_gray(im, BT_TPL)
         h, w = im.shape
         band = im[int(h*y0f):int(h*y1f), int(w*x0f):int(w*x1f)]
         imgs[i] = cv2.resize(band, (W, H), interpolation=cv2.INTER_AREA)
     print(f"    loaded in {time.time()-t0:.0f}s", flush=True)
+    if FILM:
+        _speeds = condition.run_speeds(ts, imgs)
+        _blatch = condition.latch_bonus(ts, bt_raw, META["cond"]["bonus_latch_s"])
+        cond_parts.append((ts, _speeds, _blatch))
+        print(f"    cond: speed med {np.median(_speeds[_speeds > 0]) if (_speeds > 0).any() else 0:.0f} px/s"
+              f" | bonus frames {int(_blatch.sum())}", flush=True)
     imgs_all.append(imgs); y_all.append(y); notyet_all.append(notyet)
     _dur = float(fm.get("duration_s") or (ts[-1] - ts[0] if len(ts) > 1 else 1.0))
     run_returns.append(max(_dur, 1.0))
@@ -338,6 +392,21 @@ print(f"total {n} frames | train {len(tr_ids)} | val {len(va_ids)}", flush=True)
 if frame_dts:
     META["fps"] = round(1.0 / float(np.median(np.concatenate(frame_dts))), 1)
     print(f"measured recording fps: {META['fps']}", flush=True)
+
+cond = None
+if FILM:
+    # speed_norm: prefer the pretrained encoder's corpus-wide p90 (calibrated over ALL
+    # runs incl. self-farm) so every film model shares one scale; else this demo set's p90.
+    spn = META["cond"].get("speed_norm") or (_ENC and _ENC["meta"].get("speed_p90"))
+    if not spn:
+        _pos = np.concatenate([s[s > 0] for _, s, _ in cond_parts]) if cond_parts else np.array([1.0])
+        spn = float(np.percentile(_pos, 90)) if len(_pos) else 1.0
+    META["cond"]["speed_norm"] = round(float(spn), 1)
+    cond = np.concatenate([
+        condition.build_run_cond(t_, s_, b_, META["cond"]["t_norm_s"], META["cond"]["speed_norm"])
+        for t_, s_, b_ in cond_parts])
+    print(f"cond: speed_norm {META['cond']['speed_norm']} px/s | "
+          f"bonus share {cond[:, 2].mean():.3f}", flush=True)
 
 if wandb_run:
     dataset_metrics = {
@@ -390,7 +459,28 @@ dev = torch.device("cuda")
 print("device:", dev, torch.cuda.get_device_name(0) if dev.type == "cuda" else "", flush=True)
 print(f"arch: {ARCH} | epochs: {EPOCHS} | out-prefix: {OUT_PREFIX}", flush=True)
 net = build_net_from_meta(torch, META).to(dev)
-opt = torch.optim.Adam(net.parameters(), 1e-3)
+if _ENC is not None:
+    _sd = _ENC["convs"]
+    if FILM:
+        net.convs.load_state_dict(_sd)
+    else:                                # small_cnn: conv prefix shares Sequential indices
+        _miss = net.load_state_dict(_sd, strict=False)
+        assert not _miss.unexpected_keys, f"encoder keys not in net: {_miss.unexpected_keys}"
+    print(f"encoder-init: {len(_sd)} conv tensors from {ENCODER_INIT} "
+          f"(pretrain val L1 {_ENC['meta'].get('best_val_l1')})", flush=True)
+if FREEZE_ENC:
+    _mods = net.convs if FILM else net
+    _n = 10 ** 6 if FREEZE_ENC == "all" else int(FREEZE_ENC)
+    _frozen = 0
+    for _m in _mods:
+        if isinstance(_m, nn.Conv2d):
+            if _frozen >= _n:
+                break
+            for _p in _m.parameters():
+                _p.requires_grad = False
+            _frozen += 1
+    print(f"freeze-enc: froze {_frozen} conv layer(s)", flush=True)
+opt = torch.optim.Adam((p for p in net.parameters() if p.requires_grad), 1e-3)
 lossf = nn.CrossEntropyLoss()
 BATCH = 32 if ARCH == "efficientnet_b5" else 64 if ARCH == "mobilenet_v3_large" else 128
 VAL_BATCH = 64 if ARCH == "efficientnet_b5" else 128 if ARCH == "mobilenet_v3_large" else 256
@@ -406,8 +496,21 @@ y_g = torch.from_numpy(y).to(dev)
 tr_g = torch.from_numpy(tr_ids).to(dev)
 va_g = torch.from_numpy(va_ids).to(dev)
 w_g = torch.tensor(w, dtype=torch.float32, device=dev)
+cond_g = torch.from_numpy(cond).to(dev) if FILM else None
 corr_x_g = torch.from_numpy(corr_x).to(dev).float().div_(255.0) if n_corr else None
 corr_y_g = torch.from_numpy(corr_y).to(dev) if n_corr else None
+corr_cond_g = None
+if FILM and n_corr:
+    # ponytail: corrections are context-less hit clips — speed comes from their own stack
+    # (consecutive slots are 1/fps apart), t is neutral 0.5, bonus unknown -> 0. They are
+    # only 5x-weighted extras; full-fidelity cond for them isn't worth a second pipeline.
+    _cc = np.zeros((n_corr, 3), np.float32)
+    _cc[:, 0] = 0.5
+    for _j in range(n_corr):
+        _px = condition.estimate_scroll(corr_x[_j, -2], corr_x[_j, -1])
+        if _px is not None:
+            _cc[_j, 1] = min(_px * META["fps"] / META["cond"]["speed_norm"], 2.0)
+    corr_cond_g = torch.from_numpy(_cc).to(dev)
 # NEGATIVE stacks (opt-in): only the clean "bot was passive -> hit/pit" cases (bot_action==none),
 # so we never penalise a jump/slide the bot actually attempted (mis-timed, possibly unavoidable).
 NEG_X_G = None
@@ -444,30 +547,41 @@ def demo_stacks(frame_ids):
     return imgs_g[idx_g[frame_ids]].float().div_(255.0)
 
 
+def fwd(xb, cb=None):
+    return net(xb, cb) if FILM else net(xb)
+
+
 def train_stacks(sample_ids):
     demo_mask = sample_ids < len(tr_ids)
     if bool(demo_mask.all()):
         frame_ids = tr_g[sample_ids]
-        return demo_stacks(frame_ids), y_g[frame_ids]
+        return demo_stacks(frame_ids), y_g[frame_ids], \
+            (cond_g[frame_ids] if FILM else None)
     xb = torch.empty((sample_ids.numel(), K, H, W), dtype=torch.float32, device=dev)
     yb = torch.empty((sample_ids.numel(),), dtype=torch.long, device=dev)
+    cb = torch.empty((sample_ids.numel(), 3), dtype=torch.float32, device=dev) if FILM else None
     if bool(demo_mask.any()):
         frame_ids = tr_g[sample_ids[demo_mask]]
         xb[demo_mask] = demo_stacks(frame_ids)
         yb[demo_mask] = y_g[frame_ids]
+        if FILM:
+            cb[demo_mask] = cond_g[frame_ids]
     corr_mask = ~demo_mask
     if bool(corr_mask.any()):
         ci = sample_ids[corr_mask] - len(tr_ids)
         xb[corr_mask] = corr_x_g[ci]
         yb[corr_mask] = corr_y_g[ci]
-    return xb, yb
+        if FILM:
+            cb[corr_mask] = corr_cond_g[ci]
+    return xb, yb, cb
 
 def predict_val():
     net.eval(); pr = []
     with torch.no_grad():
         for b in range(0, len(va_ids), VAL_BATCH):
-            xb = demo_stacks(va_g[b:b + VAL_BATCH])
-            pr.append(torch.softmax(net(xb), 1).cpu().numpy())
+            ids = va_g[b:b + VAL_BATCH]
+            xb = demo_stacks(ids)
+            pr.append(torch.softmax(fwd(xb, cond_g[ids] if FILM else None), 1).cpu().numpy())
     return np.concatenate(pr)
 
 def event_eval(conf=0.60):
@@ -502,16 +616,18 @@ def _augment(xb):
     return xb.clamp_(0.0, 1.0)
 
 
-print(f"augmentation: {'ON' if AUG else 'off'}", flush=True)
+print(f"augmentation: {'ON' if AUG else 'off'}"
+      + (f" | save-best ON" if SAVE_BEST else ""), flush=True)
+best = {"score": -1e9, "state": None, "ep": None}
 for ep in range(EPOCHS):
     net.train(); tot = 0; tot_neg = 0.0; nb = 0
     sampled = torch.multinomial(w_g, len(w), replacement=True)
     for b in range(0, len(w), BATCH):
-        xb, yb = train_stacks(sampled[b:b + BATCH])
+        xb, yb, cb = train_stacks(sampled[b:b + BATCH])
         if AUG:
             xb = _augment(xb)
         opt.zero_grad()
-        l = lossf(net(xb), yb)
+        l = lossf(fwd(xb, cb), yb)
         if NEG_X_G is not None:                        # "hit cam" signal on bot failure frames
             ni = torch.randint(0, NEG_X_G.shape[0], (min(BATCH, NEG_X_G.shape[0]),), device=dev)
             nb_x = _augment(NEG_X_G[ni]) if AUG else NEG_X_G[ni]
@@ -529,6 +645,12 @@ for ep in range(EPOCHS):
     if ep % 5 == 4 or ep == EPOCHS - 1:
         ne, hits, fam = event_eval()
         loss = tot / max(nb, 1)
+        if SAVE_BEST:                          # sweep's canonical score: hit rate - fam/400
+            _score = hits / max(ne, 1) - fam / 400.0
+            if _score > best["score"]:
+                best = {"score": _score, "ep": ep + 1,
+                        "state": {k: v.detach().cpu().clone()
+                                  for k, v in net.state_dict().items()}}
         print(f"ep{ep+1} loss={tot/max(nb,1):.3f}"
               + (f" neg={tot_neg/max(nb,1):.3f}" if NEG_X_G is not None else "")
               + f" events {hits}/{ne} hit, false-fires/min={fam:.0f}", flush=True)
@@ -542,6 +664,10 @@ for ep in range(EPOCHS):
                 "val/false_fires_per_min": fam,
                 "gpu/max_allocated_mb": torch.cuda.max_memory_allocated() / 1e6,
             }, step=ep + 1)
+
+if SAVE_BEST and best["state"] is not None:
+    net.load_state_dict(best["state"])
+    print(f"save-best: restored ep{best['ep']} (score {best['score']:.3f})", flush=True)
 
 model_name = f"{OUT_PREFIX}.pt"
 meta_name = "model_meta.json" if OUT_PREFIX == "model" else f"{OUT_PREFIX}_meta.json"
