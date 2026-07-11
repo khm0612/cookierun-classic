@@ -19,6 +19,7 @@ To run it unattended/detached instead, launch this same command with PowerShell 
 from __future__ import annotations
 import sys
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -26,7 +27,28 @@ ROOT = Path(__file__).resolve().parent.parent
 MONITOR = str(ROOT / "scripts" / "monitor.py")
 
 
+def _hold_display_awake() -> None:
+    """Keep the DISPLAY awake for the whole farm. When Windows lets the display sleep,
+    DXGI duplication (dxcam) yields no frames on ANY output while GDI still reads window
+    content — every run goes BLIND and the supervisor hard-faults after two zero-run
+    attempts (observed live 2026-07-11 the moment the user walked away). ES_DISPLAY_REQUIRED
+    resets the display-idle timer as long as we re-assert it; daemon thread dies with us."""
+    import ctypes
+    ES = 0x80000000 | 0x00000001 | 0x00000002   # CONTINUOUS | SYSTEM | DISPLAY
+
+    def loop():
+        while True:
+            try:
+                ctypes.windll.kernel32.SetThreadExecutionState(ES)
+            except Exception:
+                return                          # non-Windows / no kernel32: nothing to hold
+            time.sleep(30)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def main(n: int = 15) -> int:
+    _hold_display_awake()
     logdir = ROOT / "logs"
     logdir.mkdir(exist_ok=True)
     logpath = logdir / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log"
