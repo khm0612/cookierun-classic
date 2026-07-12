@@ -77,7 +77,10 @@ for rdir in runs:
     fm = json.load(open(os.path.join(rdir, "frames.json")))
     frames = sorted(fm["frames"], key=lambda f: f["idx"])
     ts = np.array([f["t"] for f in frames])
-    cache = os.path.join(rdir, f"cache_ssl_{H}x{W}.npy")
+    # crop is part of the key: same H/W with different crop fractions = different pixels,
+    # and the length-only staleness check below cannot tell them apart
+    _ctag = "-".join(f"{v:g}" for v in CROP)
+    cache = os.path.join(rdir, f"cache_ssl_{H}x{W}_{_ctag}.npy")
     if os.path.exists(cache):
         imgs = np.load(cache)
         if len(imgs) != len(frames):               # stale cache (run dir changed)

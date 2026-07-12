@@ -166,11 +166,21 @@ def score_model(model_path, meta_path, eval_demos=None, data_dir=None, device=No
     # film models also take the [t, speed, bonus] cond vector — built here from the SAME
     # helpers train2 used, so gate scores stay train-faithful.
     cond_meta = meta.get("cond") if meta.get("arch") == "small_cnn_film" else None
+    if meta.get("arch") == "small_cnn_film" and not cond_meta:
+        raise RuntimeError("film checkpoint meta has no 'cond' — cannot score")
     film_tpl = None
     if cond_meta:
+        if not cond_meta.get("speed_norm"):
+            raise RuntimeError("film meta cond.speed_norm missing/0 — score would be "
+                               "garbage-scale; retrain with current train2.py")
         from cookierun_bot.policies import condition
         from _runtime import ROOT
-        film_tpl = condition.load_bonus_template(str(ROOT / "templates"))
+        # honor bonus_trained: a model trained with bonus all-0 is scored with bonus all-0
+        if cond_meta.get("bonus_trained", True):
+            film_tpl = condition.load_bonus_template(str(ROOT / "templates"))
+            if film_tpl is None:
+                print("WARNING: templates/bonustime_norm.png missing — scoring film model "
+                      "with bonus dim all-0", flush=True)
 
     crop = [x0f, y0f, x1f, y1f]
     ks = np.arange(K - 1, -1, -1)
@@ -189,7 +199,7 @@ def score_model(model_path, meta_path, eval_demos=None, data_dir=None, device=No
                 ts_win, bt_raw, cond_meta.get("bonus_latch_s", 3.0))   # before the val cut
             cw = np.zeros((len(imgs), 3), np.float32)
             cw[:, 0] = np.clip((ts_win - ts[0]) / cond_meta.get("t_norm_s", 600.0), 0.0, 1.0)
-            cw[:, 1] = np.clip(speeds / max(cond_meta.get("speed_norm") or 1.0, 1e-6), 0.0, 2.0)
+            cw[:, 1] = np.clip(speeds / cond_meta["speed_norm"], 0.0, 2.0)
             cw[:, 2] = blatch
             cond_va_t = torch.from_numpy(cw[va - start]).to(dev)
         # rebased val-frame K-stack indices, clamped to the loaded window's first frame (matches

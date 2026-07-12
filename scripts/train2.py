@@ -126,6 +126,10 @@ if FILM and "cond" not in META:
 if not FILM:
     META.pop("cond", None)                    # a non-film arch must not carry cond meta
 BT_TPL = condition.load_bonus_template(str(ROOT / "templates")) if FILM else None
+if FILM:
+    # recorded into meta so LIVE stays consistent: a model trained with bonus all-0 must
+    # also get bonus=0 live (LearnedAgent honors this), even on a machine with the template
+    META["cond"]["bonus_trained"] = BT_TPL is not None
 if FILM and BT_TPL is None:
     print("WARNING: templates/bonustime_norm.png missing — bonus cond dim will be all-0",
           flush=True)
@@ -395,8 +399,9 @@ if frame_dts:
 
 cond = None
 if FILM:
-    # speed_norm: prefer the pretrained encoder's corpus-wide p90 (calibrated over ALL
-    # runs incl. self-farm) so every film model shares one scale; else this demo set's p90.
+    # speed_norm precedence: (1) a meta-from-inherited value wins so every retrain in a
+    # lineage keeps ONE scale (comparable cond across hot-swaps), (2) else the pretrained
+    # encoder's corpus-wide p90, (3) else this demo set's p90.
     spn = META["cond"].get("speed_norm") or (_ENC and _ENC["meta"].get("speed_p90"))
     if not spn:
         _pos = np.concatenate([s[s > 0] for _, s, _ in cond_parts]) if cond_parts else np.array([1.0])
@@ -469,6 +474,8 @@ if _ENC is not None:
     print(f"encoder-init: {len(_sd)} conv tensors from {ENCODER_INIT} "
           f"(pretrain val L1 {_ENC['meta'].get('best_val_l1')})", flush=True)
 if FREEZE_ENC:
+    if ARCH not in ("small_cnn", "small_cnn_film"):
+        raise SystemExit("--freeze-enc supports the small_cnn/small_cnn_film trunks only")
     _mods = net.convs if FILM else net
     _n = 10 ** 6 if FREEZE_ENC == "all" else int(FREEZE_ENC)
     _frozen = 0

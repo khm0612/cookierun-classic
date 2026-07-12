@@ -82,11 +82,25 @@ def test_cond_tracker_lifecycle():
     assert v1[2] == 1.0
     v2 = tr.vector(1004.5)                                 # latch expired
     assert v2[2] == 0.0
-    v3 = tr.vector(1020.0)                                 # >5s gap -> auto reset
-    assert v3.tolist() == [0.0, 0.0, 0.0]
+    # a 20s decide gap is NORMAL mid-run (BONUSTIME washouts suppress decide() up to 30s)
+    # and must NOT reset run-time; only a >RUN_GAP_RESET_S gap means a new run
+    v3 = tr.vector(1024.5)
+    assert v3[0] > 0.2 and v3[1] > 0.0
+    v4 = tr.vector(1024.5 + condition.RUN_GAP_RESET_S + 1)  # true between-runs gap
+    assert v4.tolist() == [0.0, 0.0, 0.0]
 
 
 def test_bonustime_gray_soft_off_without_template():
     img = _textured()
     assert condition.bonustime_gray(img, None) is False
+    assert condition.bonustime_bgr(np.dstack([img] * 3), None) is False
     assert condition.load_bonus_template("definitely_missing_dir") is None
+
+
+def test_latch_bonus_none_raw_is_all_zero_soft_off():
+    # missing machine-local banner template => bt_raw=None => all-0, NOT a crash — the
+    # promotion gate must degrade exactly like train2/LearnedAgent do (fail-soft, not
+    # TypeError-fail-closed-forever)
+    ts = np.arange(0.0, 5.0, 1.0)
+    out = condition.latch_bonus(ts, None)
+    assert out.shape == (5,) and (out == 0).all()

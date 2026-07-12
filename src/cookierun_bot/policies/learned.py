@@ -172,16 +172,31 @@ class LearnedAgent:
         # banner is checked here (throttled), so ai_farm/self_farm/farm all get it for
         # free. The template is machine-local — absent => bonus soft-off at 0.
         self._cond_meta = meta.get("cond") if meta.get("arch") == "small_cnn_film" else None
+        if meta.get("arch") == "small_cnn_film" and not self._cond_meta:
+            raise ValueError("small_cnn_film checkpoint has no 'cond' in its meta — the "
+                             "forward pass needs it; retrain with current train2.py")
         if self._cond_meta:
             from .condition import CondTracker, bonustime_bgr, load_bonus_template
+            if not self._cond_meta.get("speed_norm"):
+                raise ValueError("film meta cond.speed_norm is missing/0 — the speed dim "
+                                 "would silently pin at the clip; retrain with train2.py")
             self._bonustime_bgr = bonustime_bgr
             self._cond = CondTracker(
                 t_norm_s=self._cond_meta.get("t_norm_s", 600.0),
-                speed_norm=self._cond_meta.get("speed_norm", 1.0),
+                speed_norm=self._cond_meta["speed_norm"],
                 bonus_latch_s=self._cond_meta.get("bonus_latch_s", 3.0))
-            self._bt_tpl = load_bonus_template(getattr(cfg, "templates_dir", "templates"))
+            # bonus_trained=False => the model learned with the bonus dim all-0 (template
+            # was absent at train time) — feed the SAME all-0 live even if this machine
+            # has the template, or the model would see an input it never trained on.
+            self._bt_tpl = None
+            if self._cond_meta.get("bonus_trained", True):
+                self._bt_tpl = load_bonus_template(getattr(cfg, "templates_dir", "templates"))
+                if self._bt_tpl is None:
+                    print("[learned] WARNING: model trained WITH the bonus dim but "
+                          "templates/bonustime_norm.png is missing here — bonus stuck 0")
             self._bt_check_s = 0.25
             self._bt_last = 0.0
+            self._newest_img_t = 0.0    # capture time of the image in the newest slot
         self._net = build_net_from_meta(torch, meta)
         self._net.load_state_dict(torch.load(model_path, map_location="cpu"))
         self._net.to(self._device).eval()
@@ -212,6 +227,7 @@ class LearnedAgent:
         self._last_stacked = 0.0
         if self._cond_meta:
             self._cond.reset()
+            self._newest_img_t = 0.0
 
     def _preprocess(self, frame):
         h, w = frame.shape[:2]
@@ -225,12 +241,19 @@ class LearnedAgent:
         if not self._buf or now - self._last_stacked >= self._frame_gap:
             new = self._preprocess(frame).astype(np.float32) / 255.0
             if self._cond_meta and self._buf:
-                # one speed sample per NEW slot = the offline per-recorded-frame cadence
-                self._cond.on_slot(self._buf[-1], new, now - self._last_stacked)
+                # one speed sample per NEW slot = the offline per-recorded-frame cadence.
+                # dt must be the age of the IMAGE in the newest slot, not the slot gap:
+                # sub-gap ticks refresh that slot with fresher pixels, so dividing their
+                # motion by the full slot gap under-reads speed by ~meta_fps/loop_fps.
+                self._cond.on_slot(self._buf[-1], new, now - self._newest_img_t)
             self._buf.append(new)
             self._last_stacked = now
+            if self._cond_meta:
+                self._newest_img_t = now
         else:                                   # too soon: refresh only the newest slot
             self._buf[-1] = self._preprocess(frame).astype(np.float32) / 255.0
+            if self._cond_meta:
+                self._newest_img_t = now
         while len(self._buf) < self.K:
             self._buf.appendleft(self._buf[0])
         return np.stack(self._buf, 0)[None]     # (1,K,H,W)

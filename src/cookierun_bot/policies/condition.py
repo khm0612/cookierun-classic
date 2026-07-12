@@ -38,22 +38,34 @@ _SPEED_BAND_Y0 = 0.45
 _hann_cache: dict = {}
 
 
+def _banner_crop(frame) -> "np.ndarray":
+    h, w = frame.shape[:2]
+    return frame[0:int(h * _BT_ROWS), int(w * _BT_COL0):int(w * _BT_COL1)]
+
+
+def _banner_match(gray_crop, tpl) -> bool:
+    if gray_crop.size == 0:
+        return False
+    c = cv2.resize(gray_crop, (tpl.shape[1], tpl.shape[0]), interpolation=cv2.INTER_AREA)
+    return float(cv2.matchTemplate(c, tpl, cv2.TM_CCOEFF_NORMED)[0, 0]) >= BONUS_THRESH
+
+
 def bonustime_gray(gray_full, tpl) -> bool:
     """BONUSTIME banner present on a FULL grayscale frame (any resolution)."""
     if tpl is None:
         return False
-    h, w = gray_full.shape[:2]
-    c = gray_full[0:int(h * _BT_ROWS), int(w * _BT_COL0):int(w * _BT_COL1)]
-    if c.size == 0:
-        return False
-    c = cv2.resize(c, (tpl.shape[1], tpl.shape[0]), interpolation=cv2.INTER_AREA)
-    return float(cv2.matchTemplate(c, tpl, cv2.TM_CCOEFF_NORMED)[0, 0]) >= BONUS_THRESH
+    return _banner_match(_banner_crop(gray_full), tpl)
 
 
 def bonustime_bgr(frame_bgr, tpl) -> bool:
+    """Crop FIRST, then convert — this runs on the live decide() hot path where a
+    full-frame 2560x1440 cvtColor every check would be wasted work on ~98% of pixels."""
     if tpl is None:
         return False
-    return bonustime_gray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY), tpl)
+    crop = _banner_crop(frame_bgr)
+    if crop.size == 0:
+        return False
+    return _banner_match(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), tpl)
 
 
 def load_bonus_template(templates_dir) -> "np.ndarray | None":
@@ -82,10 +94,17 @@ def estimate_scroll(prev_small, cur_small) -> "float | None":
     return float(min(abs(dx), a.shape[1] * 0.25))
 
 
+RUN_GAP_RESET_S = 60.0   # decide()-gap that implies a NEW run. Must exceed the ~30s
+                         # HUD-absent stretches where farm._run_loop legitimately skips
+                         # decide() MID-RUN (BONUSTIME washouts, scooter rides) — every
+                         # run-entry path calls agent.reset() anyway, so this is only a
+                         # safety net for a missed reset, not the primary mechanism.
+
+
 class CondTracker:
     """Live-side conditioning state for LearnedAgent. Feed it stack-slot transitions via
-    on_slot(); read the vector per decision via vector(now). A >5s gap between decisions
-    auto-resets (a new run started without an explicit reset())."""
+    on_slot(); read the vector per decision via vector(now). A >RUN_GAP_RESET_S gap between
+    decisions auto-resets (a new run started without an explicit reset())."""
 
     def __init__(self, t_norm_s=T_NORM_S, speed_norm=1.0, bonus_latch_s=BONUS_LATCH_S,
                  ema=SPEED_EMA):
@@ -116,7 +135,7 @@ class CondTracker:
         self._bonus_seen = now
 
     def vector(self, now: float) -> np.ndarray:
-        if self._last is not None and now - self._last > 5.0:
+        if self._last is not None and now - self._last > RUN_GAP_RESET_S:
             self.reset()              # decision gap => new run without an explicit reset
         self._last = now
         if self._t0 is None:
@@ -148,7 +167,12 @@ def run_speeds(ts, imgs_small) -> np.ndarray:
 
 
 def latch_bonus(ts, bt_raw, latch_s=BONUS_LATCH_S) -> np.ndarray:
-    """Apply the live 3s latch to raw per-frame banner detections (bool array)."""
+    """Apply the live 3s latch to raw per-frame banner detections (bool array). bt_raw=None
+    (no banner template on this machine) => all-0, the same soft-off that train2's WARNING
+    path and LearnedAgent's missing-template path produce — scoring must not crash where
+    training and live both degrade gracefully."""
+    if bt_raw is None:
+        return np.zeros(len(ts), np.float32)
     out = np.zeros(len(ts), np.float32)
     seen = -1e9
     for i, t in enumerate(ts):
