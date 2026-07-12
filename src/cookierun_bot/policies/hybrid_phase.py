@@ -35,6 +35,11 @@ class HybridPhaseAgent:
         self._next_check = 0.0
         self._active_name = "base"
 
+    @property
+    def _device(self):
+        """ai_farm's startup banner prints agent._device — delegate to the base model."""
+        return getattr(self.base, "_device", "?")
+
     # farm code sets .explore on the agent; fan it out to both members
     @property
     def explore(self):
