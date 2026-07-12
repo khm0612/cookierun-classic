@@ -259,6 +259,12 @@ class LearnedAgent:
             self._buf.appendleft(self._buf[0])
         return np.stack(self._buf, 0)[None]     # (1,K,H,W)
 
+    def observe(self, frame) -> None:
+        """Update the frame stack (and cond tracker) WITHOUT running inference — lets a
+        wrapper keep an idle model's temporal state warm so a hand-off is never fed a
+        stale/duplicated K-stack (policies/hybrid_phase.py)."""
+        self._stack(frame)
+
     def decide(self, frame) -> ActionDecision:
         x = self._torch.from_numpy(self._stack(frame)).to(self._device)
         if self._cond_meta:

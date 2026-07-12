@@ -81,9 +81,29 @@ if _JUMP_CAP != 0.60:
 _SLIDE_CONF = os.environ.get("AIFARM_SLIDE_CONF")
 if _SLIDE_CONF is not None:
     print(f"slide-gate OVERRIDE: {_SLIDE_CONF} (AIFARM_SLIDE_CONF)", flush=True)
-agent = LearnedAgent(cfg, os.path.join(REC, "model.pt"), os.path.join(REC, "model_meta.json"),
-                     conf=min(conf, _JUMP_CAP),
-                     conf_slide=float(_SLIDE_CONF) if _SLIDE_CONF is not None else None)
+
+
+def _mk_agent(model_name, jump_conf):
+    return LearnedAgent(cfg, os.path.join(REC, f"{model_name}.pt"),
+                        os.path.join(REC, f"{model_name}_meta.json"), conf=jump_conf,
+                        conf_slide=float(_SLIDE_CONF) if _SLIDE_CONF is not None else None)
+
+
+# AIFARM_HYBRID="base,bonus" = phase-aware two-model agent (policies/hybrid_phase.py):
+# base earns in normal stages, bonus (clean dodger) takes the BONUSTIME pit gauntlets.
+# AIFARM_HYBRID_CONFS="0.60,0.45" sets per-model jump gates (default min(conf, cap) both).
+_HYBRID = os.environ.get("AIFARM_HYBRID")
+if _HYBRID:
+    from cookierun_bot.policies.hybrid_phase import HybridPhaseAgent
+    _bn, _xn = [s.strip() for s in _HYBRID.split(",")]
+    _hc = os.environ.get("AIFARM_HYBRID_CONFS", "")
+    _bc, _xc = ([float(x) for x in _hc.split(",")] if _hc
+                else [min(conf, _JUMP_CAP)] * 2)
+    agent = HybridPhaseAgent(_mk_agent(_bn, _bc), _mk_agent(_xn, _xc),
+                             templates_dir=str(ROOT / "templates"))
+    print(f"HYBRID agent: base={_bn}@{_bc} | bonus={_xn}@{_xc}", flush=True)
+else:
+    agent = _mk_agent("model", min(conf, _JUMP_CAP))
 print(f"backend: {type(dev).__name__} | dxcam: {getattr(dev,'_use_dx',None)} | model: {agent._device}", flush=True)
 
 diag = open(os.path.join(OUT, "hits.jsonl"), "a")
