@@ -123,6 +123,13 @@ FILM = ARCH == "small_cnn_film"
 if FILM and "cond" not in META:
     META["cond"] = {"dims": list(condition.COND_DIMS), "t_norm_s": condition.T_NORM_S,
                     "speed_norm": None, "bonus_latch_s": condition.BONUS_LATCH_S}
+if FILM:
+    # cond is rebuilt from scratch every training, so a new checkpoint is always trained
+    # with the CURRENT estimator. A meta-from-inherited speed_norm from a different
+    # scroll_v is on the wrong scale — drop it so calibration reruns.
+    if META["cond"].get("scroll_v") != condition.SCROLL_V:
+        META["cond"]["speed_norm"] = None
+    META["cond"]["scroll_v"] = condition.SCROLL_V
 if not FILM:
     META.pop("cond", None)                    # a non-film arch must not carry cond meta
 BT_TPL = condition.load_bonus_template(str(ROOT / "templates")) if FILM else None
@@ -362,7 +369,7 @@ for ri, rdir in enumerate(runs):
         imgs[i] = cv2.resize(band, (W, H), interpolation=cv2.INTER_AREA)
     print(f"    loaded in {time.time()-t0:.0f}s", flush=True)
     if FILM:
-        _speeds = condition.run_speeds(ts, imgs)
+        _speeds = condition.run_speeds(ts, imgs, scroll_v=META["cond"]["scroll_v"])
         _blatch = condition.latch_bonus(ts, bt_raw, META["cond"]["bonus_latch_s"])
         cond_parts.append((ts, _speeds, _blatch))
         print(f"    cond: speed med {np.median(_speeds[_speeds > 0]) if (_speeds > 0).any() else 0:.0f} px/s"
@@ -514,7 +521,8 @@ if FILM and n_corr:
     _cc = np.zeros((n_corr, 3), np.float32)
     _cc[:, 0] = 0.5
     for _j in range(n_corr):
-        _px = condition.estimate_scroll(corr_x[_j, -2], corr_x[_j, -1])
+        _px = condition.estimate_scroll(corr_x[_j, -2], corr_x[_j, -1],
+                                        META["cond"]["scroll_v"])
         if _px is not None:
             _cc[_j, 1] = min(_px * META["fps"] / META["cond"]["speed_norm"], 2.0)
     corr_cond_g = torch.from_numpy(_cc).to(dev)

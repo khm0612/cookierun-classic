@@ -75,10 +75,23 @@ def load_bonus_template(templates_dir) -> "np.ndarray | None":
                       cv2.IMREAD_GRAYSCALE)
 
 
-def estimate_scroll(prev_small, cur_small) -> "float | None":
+# Estimator version, stamped into meta["cond"]["scroll_v"] at TRAIN time. Live inference
+# and gate scoring must use the version a checkpoint was trained with — the v1->v2 offset
+# shifts every speed value, so mixing versions across train/live is exactly the drift this
+# module exists to prevent. New trainings always use the current version.
+SCROLL_V = 2
+
+
+def estimate_scroll(prev_small, cur_small, scroll_v: int = 1) -> "float | None":
     """Horizontal shift in PX between two consecutive model-res grayscale frames via phase
     correlation on the ground band. Returns None when the correlation peak is too weak to
-    trust (menu frames, scene cuts) — the caller keeps its running estimate."""
+    trust (menu frames, scene cuts) — the caller keeps its running estimate.
+
+    v1 (legacy, what pre-2026-07-12 film checkpoints trained on): abs(dx), which carries
+    cv2.phaseCorrelate's constant +0.5px centroid offset (identical frames read 0.5, a
+    3px scroll reads 2.49). v2: offset-corrected signed magnitude — game scroll (content
+    moving LEFT) is negative dx, so true px = -(dx - 0.5); reverse motion (never
+    legitimate in a runner) clamps to 0, and identical frames read exactly 0."""
     h = prev_small.shape[0]
     y0 = int(h * _SPEED_BAND_Y0)
     a = np.asarray(prev_small[y0:], np.float32)
@@ -91,6 +104,8 @@ def estimate_scroll(prev_small, cur_small) -> "float | None":
     (dx, _dy), resp = cv2.phaseCorrelate(a, b, _hann_cache[key])
     if resp < 0.10:
         return None
+    if scroll_v >= 2:
+        return float(min(max(-(dx - 0.5), 0.0), a.shape[1] * 0.25))
     return float(min(abs(dx), a.shape[1] * 0.25))
 
 
@@ -107,11 +122,12 @@ class CondTracker:
     decisions auto-resets (a new run started without an explicit reset())."""
 
     def __init__(self, t_norm_s=T_NORM_S, speed_norm=1.0, bonus_latch_s=BONUS_LATCH_S,
-                 ema=SPEED_EMA):
+                 ema=SPEED_EMA, scroll_v=1):
         self.t_norm_s = float(t_norm_s)
         self.speed_norm = max(float(speed_norm), 1e-6)
         self.bonus_latch_s = float(bonus_latch_s)
         self.ema = float(ema)
+        self.scroll_v = int(scroll_v)
         self.reset()
 
     def reset(self) -> None:
@@ -124,7 +140,7 @@ class CondTracker:
         """Called when the agent appends a NEW frame-stack slot (prev/new at model res)."""
         if prev_small is None or dt <= 1e-3 or dt > 0.5:
             return                    # unusable gap: keep the running EMA
-        px = estimate_scroll(prev_small, new_small)
+        px = estimate_scroll(prev_small, new_small, self.scroll_v)
         if px is None:
             return
         inst = px / dt
@@ -146,7 +162,7 @@ class CondTracker:
         return np.array([t, sp, b], np.float32)
 
 
-def run_speeds(ts, imgs_small) -> np.ndarray:
+def run_speeds(ts, imgs_small, scroll_v: int = 1) -> np.ndarray:
     """RAW px/sec scroll speed per frame of one recorded run (EMA-smoothed, un-normalised
     so the trainer can calibrate speed_norm over the whole corpus). imgs_small = (N,H,W)
     uint8 at model resolution, ts = recording timestamps."""
@@ -156,7 +172,7 @@ def run_speeds(ts, imgs_small) -> np.ndarray:
     for i in range(1, n):
         dt = float(ts[i] - ts[i - 1])
         if 1e-3 < dt <= 0.5:
-            px = estimate_scroll(imgs_small[i - 1], imgs_small[i])
+            px = estimate_scroll(imgs_small[i - 1], imgs_small[i], scroll_v)
             if px is not None:
                 inst = px / dt
                 s = inst if s is None else SPEED_EMA * inst + (1.0 - SPEED_EMA) * s

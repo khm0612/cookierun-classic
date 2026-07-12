@@ -108,7 +108,7 @@ for rdir in runs:
 t0 = time.time()
 all_speeds = []
 for imgs, ts in zip(IMGS, TS):
-    sp = condition.run_speeds(ts, imgs)
+    sp = condition.run_speeds(ts, imgs, scroll_v=condition.SCROLL_V)
     all_speeds.append(sp[sp > 0])
 all_speeds = np.concatenate(all_speeds) if all_speeds else np.array([1.0])
 SPEED_MED = float(np.median(all_speeds))

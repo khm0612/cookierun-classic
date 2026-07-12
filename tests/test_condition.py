@@ -33,6 +33,20 @@ def test_estimate_scroll_clamps_to_quarter_width():
     assert px is None or px <= 224 * 0.25
 
 
+def test_estimate_scroll_v2_removes_offset():
+    # v2 corrects phaseCorrelate's constant +0.5px centroid offset: identical frames read
+    # EXACTLY 0 (v1 reads 0.5), and real shifts read true magnitude (v1 reads true-0.5).
+    img = _textured()
+    assert condition.estimate_scroll(img, img, scroll_v=2) < 1e-9
+    px3 = condition.estimate_scroll(img, np.roll(img, -3, axis=1), scroll_v=2)
+    assert px3 is not None and abs(px3 - 3.0) < 0.3
+    # reverse motion (never legitimate in a runner) clamps to 0
+    rev = condition.estimate_scroll(img, np.roll(img, 3, axis=1), scroll_v=2)
+    assert rev == 0.0
+    # v1 legacy behavior unchanged (deployed checkpoints depend on it)
+    assert abs(condition.estimate_scroll(img, img) - 0.5) < 0.05
+
+
 def test_latch_bonus_bridges_gaps():
     ts = np.arange(0.0, 10.0, 1.0)
     raw = np.zeros(10, bool)

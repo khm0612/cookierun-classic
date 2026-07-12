@@ -194,7 +194,8 @@ def score_model(model_path, meta_path, eval_demos=None, data_dir=None, device=No
         cond_va_t = None
         if cond_meta:
             ts_win = ts[start:]
-            speeds = condition.run_speeds(ts_win, imgs)      # EMA warm-up inside the window:
+            speeds = condition.run_speeds(ts_win, imgs,      # EMA warm-up inside the window:
+                                          scroll_v=cond_meta.get("scroll_v", 1))
             blatch = condition.latch_bonus(                  # a few frames of settling, all
                 ts_win, bt_raw, cond_meta.get("bonus_latch_s", 3.0))   # before the val cut
             cw = np.zeros((len(imgs), 3), np.float32)

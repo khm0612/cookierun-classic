@@ -184,7 +184,8 @@ class LearnedAgent:
             self._cond = CondTracker(
                 t_norm_s=self._cond_meta.get("t_norm_s", 600.0),
                 speed_norm=self._cond_meta["speed_norm"],
-                bonus_latch_s=self._cond_meta.get("bonus_latch_s", 3.0))
+                bonus_latch_s=self._cond_meta.get("bonus_latch_s", 3.0),
+                scroll_v=self._cond_meta.get("scroll_v", 1))
             # bonus_trained=False => the model learned with the bonus dim all-0 (template
             # was absent at train time) — feed the SAME all-0 live even if this machine
             # has the template, or the model would see an input it never trained on.
