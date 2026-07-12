@@ -24,6 +24,9 @@ wandb/
 *.out
 *.err
 *.zip
+# run/A-B/training session markers (transient)
+*.done
+ab_progress.txt
 
 # --- scratch / one-off scripts ---
 scratch_*.py
