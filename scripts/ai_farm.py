@@ -92,7 +92,17 @@ def _mk_agent(model_name, jump_conf):
 # AIFARM_HYBRID="base,bonus" = phase-aware two-model agent (policies/hybrid_phase.py):
 # base earns in normal stages, bonus (clean dodger) takes the BONUSTIME pit gauntlets.
 # AIFARM_HYBRID_CONFS="0.60,0.45" sets per-model jump gates (default min(conf, cap) both).
+# DURABLE deploy: data/demo/hybrid.json {"base","bonus","confs":[..]} activates the hybrid
+# without env vars (delete the file to revert to plain model.pt); env vars still override.
 _HYBRID = os.environ.get("AIFARM_HYBRID")
+_HYB_FILE = os.path.join(REC, "hybrid.json")
+if not _HYBRID and os.path.exists(_HYB_FILE):
+    _hj = json.load(open(_HYB_FILE))
+    _HYBRID = f"{_hj['base']},{_hj['bonus']}"
+    if _hj.get("confs"):
+        os.environ.setdefault("AIFARM_HYBRID_CONFS",
+                              ",".join(str(c) for c in _hj["confs"]))
+    print(f"hybrid.json deploy: {_HYBRID} confs={_hj.get('confs')}", flush=True)
 if _HYBRID:
     from cookierun_bot.policies.hybrid_phase import HybridPhaseAgent
     _bn, _xn = [s.strip() for s in _HYBRID.split(",")]
