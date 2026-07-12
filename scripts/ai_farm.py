@@ -77,8 +77,13 @@ if os.path.exists(_mm):
 _JUMP_CAP = float(os.environ.get("AIFARM_JUMP_CAP", "0.60"))
 if _JUMP_CAP != 0.60:
     print(f"jump-gate cap OVERRIDE: {_JUMP_CAP} (AIFARM_JUMP_CAP)", flush=True)
+# AIFARM_SLIDE_CONF likewise overrides the slide gate for A/Bs (default: cfg/LearnedAgent)
+_SLIDE_CONF = os.environ.get("AIFARM_SLIDE_CONF")
+if _SLIDE_CONF is not None:
+    print(f"slide-gate OVERRIDE: {_SLIDE_CONF} (AIFARM_SLIDE_CONF)", flush=True)
 agent = LearnedAgent(cfg, os.path.join(REC, "model.pt"), os.path.join(REC, "model_meta.json"),
-                     conf=min(conf, _JUMP_CAP))
+                     conf=min(conf, _JUMP_CAP),
+                     conf_slide=float(_SLIDE_CONF) if _SLIDE_CONF is not None else None)
 print(f"backend: {type(dev).__name__} | dxcam: {getattr(dev,'_use_dx',None)} | model: {agent._device}", flush=True)
 
 diag = open(os.path.join(OUT, "hits.jsonl"), "a")
