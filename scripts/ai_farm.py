@@ -72,8 +72,13 @@ if os.path.exists(_mm):
 # 0.95, so the gate turned "hesitant jump" into "no jump" into the pit. The asymmetry
 # (learned.py docstring): a wrong jump costs a healable HP tick; a missed jump is a pit =
 # run over. Slide keeps its own strict 0.90 gate (conf_slide) — wrong slides ARE fatal.
+# AIFARM_JUMP_CAP overrides the cap for gate A/Bs (film models predict pit-jumps at lower
+# confidence than the champion — a lower cap lets them fire without touching the code).
+_JUMP_CAP = float(os.environ.get("AIFARM_JUMP_CAP", "0.60"))
+if _JUMP_CAP != 0.60:
+    print(f"jump-gate cap OVERRIDE: {_JUMP_CAP} (AIFARM_JUMP_CAP)", flush=True)
 agent = LearnedAgent(cfg, os.path.join(REC, "model.pt"), os.path.join(REC, "model_meta.json"),
-                     conf=min(conf, 0.60))
+                     conf=min(conf, _JUMP_CAP))
 print(f"backend: {type(dev).__name__} | dxcam: {getattr(dev,'_use_dx',None)} | model: {agent._device}", flush=True)
 
 diag = open(os.path.join(OUT, "hits.jsonl"), "a")
