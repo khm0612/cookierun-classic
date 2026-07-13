@@ -27,9 +27,13 @@ wandb/
 # run/A-B/training session markers (transient)
 *.done
 ab_progress.txt
+ab*_progress.txt
+sweep_progress.jsonl
+tmp/
 
 # --- scratch / one-off scripts ---
 scratch_*.py
+scratchpad_*.txt
 
 # --- android bridge build output ---
 CRBridge-debug.apk
