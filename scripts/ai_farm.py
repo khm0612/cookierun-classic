@@ -1,4 +1,4 @@
-"""Monitored AI farm: continuous Double-Coins-gated runs driven by the LearnedAgent, with
+﻿"""Monitored AI farm: continuous Double-Coins-gated runs driven by the LearnedAgent, with
 per-hit diagnostics for improving the model. For every HP drop it dumps the pre-hit window:
 what the model SAW (frames at ~-0.7s/-0.3s/impact) and what it THOUGHT (class/prob/action
 trace), so failures can be categorized (blind / fired-but-hit / cooldown-blocked) instead
@@ -196,7 +196,7 @@ for run_no in range(1, MAX_RUNS + 1):
     # is just writing those bytes to disk on a worker thread. This is the data flywheel:
     # each farm run yields on-policy trajectories + auto-mineable pit-fall labels for the
     # next IQL iteration (falls were unmeasurable before; 25 mined examples were too few).
-    rec = None
+    vrec = None                   # NOT `rec` — on_step's hit logger already binds that name
     if os.environ.get("AIFARM_RECORD") == "1":
         import queue as _q
         import threading as _th
@@ -215,7 +215,7 @@ for run_no in range(1, MAX_RUNS + 1):
 
         _wt = _th.Thread(target=_writer, daemon=True)
         _wt.start()
-        rec = {"dir": _rdir, "q": _wq, "thread": _wt, "frames": [], "keys": [], "idx": 0}
+        vrec = {"dir": _rdir, "q": _wq, "thread": _wt, "frames": [], "keys": [], "idx": 0}
         print(f">> RECORDING run to {_rdir}", flush=True)
     hp_hist = []; hits = []; steps = [0]; last_hit = [0.0]
     last_bt = [-9.0]              # bonustime latch: last time the banner was seen
@@ -249,15 +249,15 @@ for run_no in range(1, MAX_RUNS + 1):
         if ok:
             _bts = buf.tobytes()
             ring.append((now, _bts, cls, prob, ACT.get(decision.action, "?")))
-            if rec is not None:
+            if vrec is not None:
                 try:
-                    rec["q"].put_nowait((rec["idx"], _bts))
-                    rec["frames"].append({"idx": rec["idx"], "t": now})
+                    vrec["q"].put_nowait((vrec["idx"], _bts))
+                    vrec["frames"].append({"idx": vrec["idx"], "t": now})
                 except Exception:
                     pass                       # full queue: drop frame, keep idx monotonic
-                rec["idx"] += 1
+                vrec["idx"] += 1
                 if decision.action != ACTION_NOOP:
-                    rec["keys"].append({
+                    vrec["keys"].append({
                         "t": now, "action": ACT.get(decision.action, "none"),
                         "dur": 0.5 if decision.action == ACTION_SLIDE else 0.1})
         if bonustime(f):
@@ -347,15 +347,15 @@ for run_no in range(1, MAX_RUNS + 1):
         print("!! BLIND RUN detected (0 decisions) — exiting for a clean restart", flush=True)
         dev.stop()
         sys.exit(2)
-    if rec is not None:                        # finalize the training recording
-        rec["q"].put(None)
-        rec["thread"].join(timeout=10)
-        json.dump({"frames": rec["frames"], "save_w": 640, "duration_s": dur,
+    if vrec is not None:                       # finalize the training recording
+        vrec["q"].put(None)
+        vrec["thread"].join(timeout=10)
+        json.dump({"frames": vrec["frames"], "save_w": 640, "duration_s": dur,
                    "actual_fps": round(len(rec["frames"]) / max(dur, 0.1), 1)},
-                  open(os.path.join(rec["dir"], "frames.json"), "w"))
-        json.dump(rec["keys"], open(os.path.join(rec["dir"], "keys.json"), "w"))
-        print(f">> RECORDED {len(rec['frames'])} frames + {len(rec['keys'])} actions "
-              f"-> {os.path.basename(rec['dir'])}", flush=True)
+                  open(os.path.join(vrec["dir"], "frames.json"), "w"))
+        json.dump(vrec["keys"], open(os.path.join(vrec["dir"], "keys.json"), "w"))
+        print(f">> RECORDED {len(vrec['frames'])} frames + {len(vrec['keys'])} actions "
+              f"-> {os.path.basename(vrec['dir'])}", flush=True)
     _contact = (len(hits) + rebounds[0]) / max(dur / 60, 0.01)   # every HP dip incl. the
     print(f">> RUN {run_no} OVER @ {dur:.0f}s | {len(hits)} hits ({len(hits)/max(dur/60,0.01):.1f}/min, "
           f"{bt_skipped[0]} bonus-artifact skipped, {rebounds[0]} rebound-discarded) "
