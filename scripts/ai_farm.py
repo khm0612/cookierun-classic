@@ -191,6 +191,32 @@ for run_no in range(1, MAX_RUNS + 1):
     # death dump can reach back to the FATAL moment (the old 2.5s raw ring filled entirely
     # with the post-death static scene — every death clip was the same frozen frame).
     ring = deque(maxlen=600)      # (t, jpg_bytes, cls, prob, action)
+    # AIFARM_RECORD=1: persist EVERY run as training data (data/botrun_*/ in the demo
+    # recording schema) — the frames are ALREADY JPEG-encoded for the ring, so recording
+    # is just writing those bytes to disk on a worker thread. This is the data flywheel:
+    # each farm run yields on-policy trajectories + auto-mineable pit-fall labels for the
+    # next IQL iteration (falls were unmeasurable before; 25 mined examples were too few).
+    rec = None
+    if os.environ.get("AIFARM_RECORD") == "1":
+        import queue as _q
+        import threading as _th
+        _rdir = os.path.join(os.path.dirname(REC), f"botrun_{time.strftime('%m%d_%H%M%S')}")
+        os.makedirs(os.path.join(_rdir, "frames"), exist_ok=True)
+        _wq = _q.Queue(maxsize=1024)
+
+        def _writer():
+            while True:
+                item = _wq.get()
+                if item is None:
+                    return
+                _i, _b = item
+                with open(os.path.join(_rdir, "frames", f"{_i:06d}.jpg"), "wb") as _fh:
+                    _fh.write(_b)
+
+        _wt = _th.Thread(target=_writer, daemon=True)
+        _wt.start()
+        rec = {"dir": _rdir, "q": _wq, "thread": _wt, "frames": [], "keys": [], "idx": 0}
+        print(f">> RECORDING run to {_rdir}", flush=True)
     hp_hist = []; hits = []; steps = [0]; last_hit = [0.0]
     last_bt = [-9.0]              # bonustime latch: last time the banner was seen
     bt_skipped = [0]
@@ -221,7 +247,19 @@ for run_no in range(1, MAX_RUNS + 1):
         small = cv2.resize(f, (640, 360))
         ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if ok:
-            ring.append((now, buf.tobytes(), cls, prob, ACT.get(decision.action, "?")))
+            _bts = buf.tobytes()
+            ring.append((now, _bts, cls, prob, ACT.get(decision.action, "?")))
+            if rec is not None:
+                try:
+                    rec["q"].put_nowait((rec["idx"], _bts))
+                    rec["frames"].append({"idx": rec["idx"], "t": now})
+                except Exception:
+                    pass                       # full queue: drop frame, keep idx monotonic
+                rec["idx"] += 1
+                if decision.action != ACTION_NOOP:
+                    rec["keys"].append({
+                        "t": now, "action": ACT.get(decision.action, "none"),
+                        "dur": 0.5 if decision.action == ACTION_SLIDE else 0.1})
         if bonustime(f):
             last_bt[0] = now
         if now - last_pit[0] > 4.0 and pitfall(f):     # prompt shows ~1-2s; 4s refractory
@@ -309,6 +347,15 @@ for run_no in range(1, MAX_RUNS + 1):
         print("!! BLIND RUN detected (0 decisions) — exiting for a clean restart", flush=True)
         dev.stop()
         sys.exit(2)
+    if rec is not None:                        # finalize the training recording
+        rec["q"].put(None)
+        rec["thread"].join(timeout=10)
+        json.dump({"frames": rec["frames"], "save_w": 640, "duration_s": dur,
+                   "actual_fps": round(len(rec["frames"]) / max(dur, 0.1), 1)},
+                  open(os.path.join(rec["dir"], "frames.json"), "w"))
+        json.dump(rec["keys"], open(os.path.join(rec["dir"], "keys.json"), "w"))
+        print(f">> RECORDED {len(rec['frames'])} frames + {len(rec['keys'])} actions "
+              f"-> {os.path.basename(rec['dir'])}", flush=True)
     _contact = (len(hits) + rebounds[0]) / max(dur / 60, 0.01)   # every HP dip incl. the
     print(f">> RUN {run_no} OVER @ {dur:.0f}s | {len(hits)} hits ({len(hits)/max(dur/60,0.01):.1f}/min, "
           f"{bt_skipped[0]} bonus-artifact skipped, {rebounds[0]} rebound-discarded) "
