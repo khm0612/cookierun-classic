@@ -66,7 +66,8 @@ x0f, y0f, x1f, y1f = CROP
 if RUNS:
     run_dirs = [os.path.join(BASE, r.strip()) for r in RUNS.split(",") if r.strip()]
 else:
-    run_dirs = sorted(d for d in glob.glob(os.path.join(BASE, "demo_self_*"))
+    run_dirs = sorted(d for d in glob.glob(os.path.join(BASE, "demo_self_*")) +
+                      glob.glob(os.path.join(BASE, "botrun_*"))   # AIFARM_RECORD flywheel runs
                       if os.path.exists(os.path.join(d, "frames.json")))
     run_dirs += [os.path.join(BASE, r) for r in ("hf2", "hf3", "hf4")
                  if os.path.exists(os.path.join(BASE, r, "frames.json"))]
