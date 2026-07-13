@@ -351,7 +351,7 @@ for run_no in range(1, MAX_RUNS + 1):
         vrec["q"].put(None)
         vrec["thread"].join(timeout=10)
         json.dump({"frames": vrec["frames"], "save_w": 640, "duration_s": dur,
-                   "actual_fps": round(len(rec["frames"]) / max(dur, 0.1), 1)},
+                   "actual_fps": round(len(vrec["frames"]) / max(dur, 0.1), 1)},
                   open(os.path.join(vrec["dir"], "frames.json"), "w"))
         json.dump(vrec["keys"], open(os.path.join(vrec["dir"], "keys.json"), "w"))
         print(f">> RECORDED {len(vrec['frames'])} frames + {len(vrec['keys'])} actions "
