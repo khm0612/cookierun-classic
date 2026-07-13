@@ -42,3 +42,6 @@ android-bridge/build/
 android-bridge/app/build/
 android-bridge/local.properties
 android-bridge/.idea/
+
+# analysis outputs (regenerable)
+fall_forensics.json

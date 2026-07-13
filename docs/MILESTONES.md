@@ -126,19 +126,26 @@ oversample the double-tap sequences found in hf* demos.
 **Acceptance: PITS ≤ 1.5/run sustained over a 12-run batch.**
 
 M1.1 proved the dominant failure is BLINDNESS (41/46 no-jump falls have jump-conf ~0), so the
-only no-human way to reduce falls is to make the policy SEE the pit. The miners produce perfect
-supervised labels for free: "pit within 1.5s" (80 positives) / "hit within 400ms" (thousands)
-for every recorded frame. Plan:
-1. **Train a hazard head** (offline, no emulator, LOW risk — do this next): small MLP head on
-   the frozen/finetuned SSL encoder features, binary "pit within 1.5s". Class-balance the 80
-   positives against negatives; report held-out precision/recall on a run-level split. If it
-   can't separate pits at all, the pixels lack the signal and only human demos remain.
-2. **Wire as a jump trigger, not just a gate modulator** (live change, supervised batch): when
-   P(pit) crosses a threshold, FORCE a jump (and a second tap in the 225-315s band for the
-   fired-in-time cases) — because the base policy contributes ~0 confidence, a soft
-   `gate − k·P` won't lift it over the line; the head must be able to fire on its own.
-3. Every recorded batch adds pit positives, so unlike imitation this compounds.
-Build the trainer first; only wire live after it shows real held-out separation.
+only no-human way to reduce falls is to make the policy SEE the pit.
+
+**M4.1 hazard head DONE 2026-07-13 (`scripts/train_hazard.py`) — THE SIGNAL EXISTS.** Small
+binary head on iql3's warm-started conv trunk, supervised by "pit-lift prompt within 1.5s"
+(109 mined falls across 42 runs), run-level held-out split:
+- **AP 0.33 vs 0.011 base rate = ~30x lift** — the pits are genuinely visible in the pixels.
+- **Per-pit recall (deployment metric): 75% @thr 0.7 (21/28 held-out pits) at 5.7 false-jumps/min;
+  57% @0.9 at 3.7/min; 54% @0.97 at 3.0/min.**
+- Conclusion: the blindness is a POLICY limitation, not an information limit — a detector can
+  recover most pits with no human data. Confirms the roadmap re-route.
+
+**Next (live change, needs a supervised first batch): wire the head as a jump TRIGGER.**
+Because the base policy contributes ~0 conf, a soft `gate − k·P` won't lift it over the line —
+the head must fire on its own. Load `hazard.pt` alongside the hybrid in ai_farm; when P(pit)
+≥ thr (start 0.7) AND not in BONUSTIME, force a jump (+ a second tap in the 225-315s band for
+the fired-in-time cases). Validate on a 6-run arm + same-session iql3 control, PITS only;
+tune thr on the recall/false-fire curve above. Every recorded batch adds pit positives, so
+unlike imitation this compounds. Caveats to watch live: label window was [prompt−1.5s, prompt]
+so some fires may be too late to clear the ledge (true early-enough recall ≤ 75%); false fires
+during BONUSTIME are why the trigger is gated to non-bonus.
 
 ## M5 — Stretch / opportunistic (attempt when M1-M4 land)
 
