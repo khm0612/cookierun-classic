@@ -49,6 +49,23 @@ def bonustime(f) -> bool:
     c = cv2.resize(c, (_BT_TPL.shape[1], _BT_TPL.shape[0]), interpolation=cv2.INTER_AREA)
     return float(cv2.matchTemplate(c, _BT_TPL, cv2.TM_CCOEFF_NORMED)[0, 0]) >= 0.30
 
+
+# PIT-FALL detector: the "5 for 1 Pit Lift" revive pill appears at EVERY fall (the user's
+# setup tanks up to 3 falls before true death, so falls cause NO HP drop and NO terminal —
+# they were invisible to hits.jsonl AND to the IQL reward until this). Same fixed-position
+# scale-normalized match pattern as bonustime; fractions measured off r01_death_d11.jpg.
+_PIT_TPL = cv2.imread(str(ROOT / "templates" / "pitlift_norm.png"), cv2.IMREAD_GRAYSCALE)
+
+
+def pitfall(f) -> bool:
+    if _PIT_TPL is None:
+        return False
+    h, w = f.shape[:2]
+    c = cv2.cvtColor(f[int(h * 0.830):int(h * 0.956), int(w * 0.372):int(w * 0.684)],
+                     cv2.COLOR_BGR2GRAY)
+    c = cv2.resize(c, (_PIT_TPL.shape[1], _PIT_TPL.shape[0]), interpolation=cv2.INTER_AREA)
+    return float(cv2.matchTemplate(c, _PIT_TPL, cv2.TM_CCOEFF_NORMED)[0, 0]) >= 0.55
+
 cfg = load_config(str(CONFIG))
 cfg = farm._auto_serial_config(cfg, log=print)
 dev = open_device(cfg); dev.start()
@@ -177,6 +194,8 @@ for run_no in range(1, MAX_RUNS + 1):
     hp_hist = []; hits = []; steps = [0]; last_hit = [0.0]
     last_bt = [-9.0]              # bonustime latch: last time the banner was seen
     bt_skipped = [0]
+    pits = [0]                    # PIT FALLS this run (revive-tanked falls included — the
+    last_pit = [-9.0]             # setup absorbs 3, so these never show in hp/terminals)
     # REBOUND-CONFIRM: a real hit leaves hp PERSISTENTLY lower; an overlay sweeping the
     # HP strip (bonus washes, zone-title cards — background-dependent, so the banner
     # template alone can't catch them all: the bright-jungle zone dropped its score
@@ -205,6 +224,10 @@ for run_no in range(1, MAX_RUNS + 1):
             ring.append((now, buf.tobytes(), cls, prob, ACT.get(decision.action, "?")))
         if bonustime(f):
             last_bt[0] = now
+        if now - last_pit[0] > 4.0 and pitfall(f):     # prompt shows ~1-2s; 4s refractory
+            pits[0] += 1
+            last_pit[0] = now
+            print(f"PIT FALL #{pits[0]} @ {now:.0f}s", flush=True)
         hp = hp_frac(f)
         hp_hist.append((now, hp))
         while hp_hist and now - hp_hist[0][0] > 1.1: hp_hist.pop(0)
@@ -286,8 +309,10 @@ for run_no in range(1, MAX_RUNS + 1):
         print("!! BLIND RUN detected (0 decisions) — exiting for a clean restart", flush=True)
         dev.stop()
         sys.exit(2)
+    _contact = (len(hits) + rebounds[0]) / max(dur / 60, 0.01)   # every HP dip incl. the
     print(f">> RUN {run_no} OVER @ {dur:.0f}s | {len(hits)} hits ({len(hits)/max(dur/60,0.01):.1f}/min, "
           f"{bt_skipped[0]} bonus-artifact skipped, {rebounds[0]} rebound-discarded) "
+          f"| PITS={pits[0]} | contact={_contact:.1f}/min "
           f"| fps={fps:.0f} | jump={acts[ACTION_JUMP]} slide={acts[ACTION_SLIDE]}", flush=True)
     res = farm.read_run_result(dev, cfg, matcher)
     # audit trail: save the Result frame — a clipped OCR region misread 11,411 for what
