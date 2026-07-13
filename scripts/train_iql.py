@@ -51,6 +51,11 @@ TAU = float(_farg("--tau", 0.7))
 BETA = float(_farg("--beta", 3.0))
 OUT_PREFIX = _farg("--out-prefix", "iql")
 HIT_R, DEATH_R, LIVE_R = -1.0, -5.0, 0.01
+# PIT FALLS: the user's setup revive-tanks up to 3 falls, so a fall causes NO HP drop and
+# NO terminal — without this explicit penalty the reward is blind to the exact failure the
+# clean-run objective cares about most (why IQL-1 never learned pits). Falls are mined
+# offline via the fixed-position "5 for 1 Pit Lift" revive-prompt template.
+PIT_R = float(_farg("--pit-r", -4.0))
 torch.manual_seed(0)
 
 meta = json.load(open(os.path.join(BASE, "demo", "model_meta.json")))
@@ -69,6 +74,38 @@ print(f"IQL corpus: {[os.path.basename(r) for r in run_dirs]}", flush=True)
 
 # HP-bar ROI as fractions of the RAW 960x540 recording (mine_negatives.py calibration)
 _HP_Y0, _HP_Y1, _HP_X0, _HP_X1 = 0.096, 0.141, 0.083, 0.823
+# Pit-Lift revive prompt ROI (fractions; ai_farm.pitfall calibration off death frames)
+_PIT_TPL = cv2.imread(os.path.join(BASE, "..", "templates", "pitlift_norm.png"),
+                      cv2.IMREAD_GRAYSCALE)
+
+
+def mine_pits(rdir, frames, ts):
+    """Frame indices where a pit fall's revive prompt is visible (4s refractory), cached.
+    Reads the COLOR originals — the prompt straddles the model crop's bottom edge."""
+    cache = os.path.join(rdir, "cache_pits.npy")
+    if os.path.exists(cache):
+        pit_idx = np.load(cache)
+        return pit_idx.tolist()
+    if _PIT_TPL is None:
+        print("  (no pitlift template — pit mining skipped)", flush=True)
+        return []
+    fdir = os.path.join(rdir, "frames")
+    pit_idx, last = [], -9.0
+    for i, fr in enumerate(frames):
+        if ts[i] - last <= 4.0:
+            continue
+        im = cv2.imread(os.path.join(fdir, f"{fr['idx']:06d}.jpg"))
+        if im is None:
+            continue
+        h, w = im.shape[:2]
+        c = cv2.cvtColor(im[int(h * 0.830):int(h * 0.956), int(w * 0.372):int(w * 0.684)],
+                         cv2.COLOR_BGR2GRAY)
+        c = cv2.resize(c, (_PIT_TPL.shape[1], _PIT_TPL.shape[0]), interpolation=cv2.INTER_AREA)
+        if float(cv2.matchTemplate(c, _PIT_TPL, cv2.TM_CCOEFF_NORMED)[0, 0]) >= 0.55:
+            pit_idx.append(i)
+            last = ts[i]
+    np.save(cache, np.array(pit_idx, np.int64))
+    return pit_idx
 
 
 def mine_hp(rdir, frames):
@@ -151,8 +188,14 @@ for rdir in run_dirs:
     rew = np.full(n, LIVE_R, np.float32)
     hidx = hit_frames(ts, hp)
     rew[hidx] += HIT_R
+    pidx = mine_pits(rdir, frames, ts)
+    # penalize the frames LEADING INTO the fall (the prompt shows ~0.5-1s after the miss;
+    # the mistimed/missing jump happened ~0.5s earlier) so credit lands on the decision
+    for pi in pidx:
+        lo = np.searchsorted(ts, ts[pi] - 1.0)
+        rew[lo:pi + 1] += PIT_R / max(pi + 1 - lo, 1)
     rew[-1] += DEATH_R                     # run end = death (or the human stopped: close enough)
-    print(f"  {os.path.basename(rdir)}: {n} frames | {len(hidx)} hits | "
+    print(f"  {os.path.basename(rdir)}: {n} frames | {len(hidx)} hits | {len(pidx)} PIT FALLS | "
           f"actions {dict(zip(CLASSES, np.bincount(act, minlength=3).tolist()))}", flush=True)
     imgs_all.append(imgs); act_all.append(act); rew_all.append(rew)
     run_start.extend([offset] * n)
