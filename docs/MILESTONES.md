@@ -45,36 +45,50 @@ wider pit-spread, plain pit-oversampling, unfiltered self-play scaling.
 
 ---
 
-## M1 — Cheap config-level wins (one evening, zero training)
+## M1 — Fall forensics DONE 2026-07-13 → roadmap RE-ROUTED
 
-**Acceptance: PITS ≤ 2.0 on a 6-run arm with a same-session iql3 control.**
+**M1.1 fall forensics shipped (`scripts/fall_forensics.py`, run over 80 mined falls). The
+findings overturn the original M1/M2 priority order — read these before doing anything else.**
 
-1. **Fall forensics (do FIRST — it routes everything after).** Pure offline analysis of the
-   ~80 mined falls across botrun_*/demo_self_*/hf* recordings (~60-line script):
-   - For each fall index in `cache_pits.npy`, inspect the recorded keys/model decisions in
-     the 1.5s before it and classify: **(a) no-jump** (never fired → gating problem),
-     **(b) late-jump** (fired <300ms before → timing problem), **(c) insufficient-jump**
-     (fired in time but fell anyway → needs DOUBLE JUMP; the policy head emits per-frame
-     actions so a second tap is expressible, but the model may never have learned it —
-     check hf* demos for rapid double-taps near pits).
-   - Also test **post-revive clustering**: fraction of falls within 8s of a previous
-     pit-lift (disorientation hypothesis) — if >30%, add a temporary post-revive caution
-     window (lower gate for 5s after the pitfall detector fires; the detector already runs
-     live in ai_farm).
-   - Build the **fall-time histogram** (falls vs seconds-into-run, 15s buckets) → feeds item 2.
-2. **Data-driven jump-gate schedule** (top expected gain/effort). New env
-   `AIFARM_GATE_SCHEDULE="120-180:0.35,240-300:0.35"` (~15 lines in ai_farm agent step):
-   inside histogram hot windows the jump gate drops 0.45→0.35; outside, unchanged.
-   Rationale: global 0.40 was cleaner but −55s survival (false jumps everywhere); windowed
-   gates buy pit-jump recall only where pits live. Wrong jumps are HP-cheap; missed
-   pit-jumps are fatal. Expected −0.5 to −1.0 falls/run.
-3. **Auto-refresh live verification**: force one trip (`AIFARM_FPS_MIN=200`, 3-run batch),
-   watch a full refresh cycle once, then leave default 45 on for every batch forever.
-4. **OR-ensemble arm** (config-only): `AIFARM_HYBRID="iql4c,sslfilm_hf4"` + gate schedule.
-   iql4c was the contact winner (16.0 vs 19.2 same-session); with schedule-patched pit
-   coverage it may beat iql3-alone. 6-run arm.
-5. **Per-run zone report**: append fall bucket times to the RUN OVER line (one print change)
-   so every future batch refines the histogram for free.
+Failure-mode breakdown (executed keys, 3s pre-fall window):
+- **no-jump 57.5%** (46/80) — DOMINANT. Model never fired a jump.
+- **fired-in-time 26.2%** (21/80) — jumped with adequate lead (median 0.89s) and fell anyway.
+- **late-jump 8.8%** (7/80) — fired < 0.35s before the prompt (too late).
+- **wrong-action 7.5%** (6/80) — slid into the pit (misread obstacle).
+
+**Model replay of the 46 no-jump falls (iql3 base, live gate 0.45) — THE routing result:**
+- **BLIND 41/46**: max jump-conf over the WHOLE pre-fall window < 0.30 (median 0.00). The
+  model does not see these pits at all.
+- **GATED 0/46**: none sat in [0.30, 0.45). **There is no suppressed confidence to un-gate.**
+- NEAR 5/46: conf ≥ 0.45 but no executed jump (replay/live stride mismatch; execution gap).
+
+**CONSEQUENCE — a gate schedule cannot fix the dominant mode** (you can't un-gate a 0.00).
+This also explains why iql4's wider pit-spread/oversample did nothing and why turn-2 plateaued:
+the problem is VISION (the policy is blind to these pits), not gating or imitation quality.
+IQL's advantage-weighted BC can only upweight actions *present* in the data, and the data has
+almost no successful jumps over the 225-315s pits (humans fell only 2× total in hf2/3/4).
+
+Fall-time histogram: **starkly bimodal** — ~zero falls before 150s, a small cluster 150-180s,
+and a massive cluster **225-315s** (the ~55-65k-collected candy gauntlet, long-known). This
+window is where any pit-specific intervention must act.
+
+Post-revive clustering: **67%** (32/48 non-first falls within 8s of the previous fall) — the
+character revives at/just-before the same hazard and re-falls. Well above the 30% threshold.
+
+**RE-PRIORITIZED next steps (supersedes the old M1.2 gate-schedule plan):**
+1. **[demoted] Gate schedule** — only 5 NEAR falls could benefit; not worth a night. Skip
+   unless it rides along free with something else.
+2. **Post-revive forced-jump heuristic** (cheap, model-independent, ~15 lines in ai_farm):
+   when `pitfall()` fires, script a single cautionary jump ~0.8-1.2s after the revive
+   resumes. Attacks the 67% clustering WITHOUT needing the model to see the pit. Needs a
+   supervised first batch (live-file change). **Do this first of the live changes.**
+3. **Hazard-prediction head (was M4) — PROMOTED to the primary no-human lever.** The 80 falls
+   are perfect supervision for "pit within 1.5s"; a small head on the SSL encoder learns to
+   SEE the pit from pixels — the one thing gating/imitation can't add. See M4 (now the main line).
+4. **Auto-refresh live verification** (`AIFARM_FPS_MIN=200`, 3-run batch) — still worth doing.
+5. **Double-jump probe**: the 21 fired-in-time falls may need a second tap. Check hf* demos
+   for rapid double-taps near pits; if present, oversample them in M2, else the head (item 3)
+   must also trigger a double-tap in the 225-315s band.
 
 ## M2 — Selective imitation: the corrected flywheel (one overnight)
 
@@ -107,16 +121,24 @@ oversample the double-tap sequences found in hf* demos.
    gained is less reaction latency — the same lateness attacked from the compute side.
    Keep only if the RUN OVER fps stat gains ≥10% with no control-quality regression.
 
-## M4 — Hazard-prediction head (the big build, one full session)
+## M4 — Hazard-prediction head — PROMOTED to the primary no-human lever (M1.1 finding)
 
 **Acceptance: PITS ≤ 1.5/run sustained over a 12-run batch.**
 
-The miners produce perfect supervised labels with zero human effort: "hit within 400ms" /
-"pit fall within 1.5s" for every recorded frame. Add a small aux head on the SSL encoder
-(reuse pretrain_encoder.py plumbing), train on ~80 falls + thousands of hits, and use it at
-inference as a **gate modulator**: `gate = base_gate − k·P(hazard)`. This is M1's time
-schedule learned per-frame from pixels — strictly more general, and every recorded batch
-improves it. Build only after M1/M2 prove gate modulation moves PITS at all.
+M1.1 proved the dominant failure is BLINDNESS (41/46 no-jump falls have jump-conf ~0), so the
+only no-human way to reduce falls is to make the policy SEE the pit. The miners produce perfect
+supervised labels for free: "pit within 1.5s" (80 positives) / "hit within 400ms" (thousands)
+for every recorded frame. Plan:
+1. **Train a hazard head** (offline, no emulator, LOW risk — do this next): small MLP head on
+   the frozen/finetuned SSL encoder features, binary "pit within 1.5s". Class-balance the 80
+   positives against negatives; report held-out precision/recall on a run-level split. If it
+   can't separate pits at all, the pixels lack the signal and only human demos remain.
+2. **Wire as a jump trigger, not just a gate modulator** (live change, supervised batch): when
+   P(pit) crosses a threshold, FORCE a jump (and a second tap in the 225-315s band for the
+   fired-in-time cases) — because the base policy contributes ~0 confidence, a soft
+   `gate − k·P` won't lift it over the line; the head must be able to fire on its own.
+3. Every recorded batch adds pit positives, so unlike imitation this compounds.
+Build the trainer first; only wire live after it shows real held-out separation.
 
 ## M5 — Stretch / opportunistic (attempt when M1-M4 land)
 
