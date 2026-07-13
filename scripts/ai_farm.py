@@ -140,6 +140,21 @@ if _HYBRID:
     print(f"HYBRID agent: base={_bn}@{_bc} | bonus={_xn}@{_xc}", flush=True)
 else:
     agent = _mk_agent("model", min(conf, _JUMP_CAP))
+
+# AIFARM_HAZARD="hazard" wraps the agent with the learned pit-fall trigger (M4.2): the base
+# policy is BLIND to the pits that kill it (M1.1), so this detector forces a jump when P(pit)
+# crosses AIFARM_HAZARD_THR (default 0.7) outside BONUSTIME. Off by default => deployed
+# behaviour unchanged. hazard.pt is trained by scripts/train_hazard.py.
+_HAZ = os.environ.get("AIFARM_HAZARD")
+if _HAZ:
+    from cookierun_bot.policies.hazard_trigger import HazardTrigger
+    _hpath = _HAZ if _HAZ.endswith(".pt") else os.path.join(REC, f"{_HAZ}.pt")
+    _hmeta = _hpath[:-3] + "_meta.json"
+    agent = HazardTrigger(agent, _hpath, _hmeta,
+                          thr=float(os.environ.get("AIFARM_HAZARD_THR", "0.7")),
+                          check_every=int(os.environ.get("AIFARM_HAZARD_EVERY", "3")))
+    print(f"HAZARD trigger: {os.path.basename(_hpath)} @ thr "
+          f"{os.environ.get('AIFARM_HAZARD_THR', '0.7')}", flush=True)
 print(f"backend: {type(dev).__name__} | dxcam: {getattr(dev,'_use_dx',None)} | model: {agent._device}", flush=True)
 
 diag = open(os.path.join(OUT, "hits.jsonl"), "a")
@@ -369,7 +384,8 @@ for run_no in range(1, MAX_RUNS + 1):
     print(f">> RUN {run_no} OVER @ {dur:.0f}s | {len(hits)} hits ({len(hits)/max(dur/60,0.01):.1f}/min, "
           f"{bt_skipped[0]} bonus-artifact skipped, {rebounds[0]} rebound-discarded) "
           f"| PITS={pits[0]} | contact={_contact:.1f}/min "
-          f"| fps={fps:.0f} | jump={acts[ACTION_JUMP]} slide={acts[ACTION_SLIDE]}", flush=True)
+          f"| fps={fps:.0f} | jump={acts[ACTION_JUMP]} slide={acts[ACTION_SLIDE]}"
+          f"{f' | hazard-fires={agent.fires}' if hasattr(agent, 'fires') else ''}", flush=True)
     res = farm.read_run_result(dev, cfg, matcher)
     # audit trail: save the Result frame — a clipped OCR region misread 11,411 for what
     # should have been ~6 digits (observed live); the saved frame settles disputes.
