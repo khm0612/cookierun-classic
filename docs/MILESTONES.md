@@ -137,15 +137,28 @@ binary head on iql3's warm-started conv trunk, supervised by "pit-lift prompt wi
 - Conclusion: the blindness is a POLICY limitation, not an information limit — a detector can
   recover most pits with no human data. Confirms the roadmap re-route.
 
-**Next (live change, needs a supervised first batch): wire the head as a jump TRIGGER.**
-Because the base policy contributes ~0 conf, a soft `gate − k·P` won't lift it over the line —
-the head must fire on its own. Load `hazard.pt` alongside the hybrid in ai_farm; when P(pit)
-≥ thr (start 0.7) AND not in BONUSTIME, force a jump (+ a second tap in the 225-315s band for
-the fired-in-time cases). Validate on a 6-run arm + same-session iql3 control, PITS only;
-tune thr on the recall/false-fire curve above. Every recorded batch adds pit positives, so
-unlike imitation this compounds. Caveats to watch live: label window was [prompt−1.5s, prompt]
-so some fires may be too late to clear the ledge (true early-enough recall ≤ 75%); false fires
-during BONUSTIME are why the trigger is gated to non-bonus.
+**M4.2 hazard trigger wired + live-tested 2026-07-14 (`policies/hazard_trigger.py`, env-gated,
+OFF by default) — MECHANICALLY WORKS, but net-harmful as implemented; two bigger findings:**
+- 5-run control (hybrid, no trigger) on a FRESH emulator: **PITS 0,0,0,0,0 = 0.0/run** at fps
+  50-54 (bonus-heavy runs). The fresh-emulator hybrid is ALREADY pit-free — **falls correlate
+  with DEGRADED fps, not model blindness.** Tonight's earlier 2.5-PITS baseline was a degraded
+  (fps 37-45) session. So the mined fall corpus is largely a low-fps artifact.
+- hazard arm: the head's EVERY-FRAME forward dropped fps 50->37 and PITS rose to 2/run — even
+  on a run where it fired 0 times. Since fps is the dominant fall driver, the compute cost is
+  net-negative. A frame throttle (every 3rd, `AIFARM_HAZARD_EVERY`) still left fps ~38-40
+  because the per-frame preprocess (crop/gray/resize) is also a cost.
+- **BONUS: the M0 auto-refresh FIRED LIVE for the first time** (the hazard's fps drop read as
+  degradation), rebooted the emulator in 28s and resumed the batch — validates task #5.
+- Run-type variance (bonus fraction) swamped the A/B: control drew bonus-heavy runs (0 PITS),
+  hazard drew base-heavy runs (2 PITS) — not comparable.
+
+**REVISED conclusion: the #1 real pit lever is keeping fps HIGH (auto-refresh), not adding a
+detector.** The hazard trigger is kept in-tree, OFF by default, for a future async/cheaper
+re-do. To make it net-positive it must (a) run on a background thread so it never blocks the
+decision loop, or (b) be a tiny distilled net + throttled preprocess, so fps stays >45. Only
+then re-test, and only in a controlled base-heavy, fps-matched A/B (this session couldn't
+isolate the effect). Realistically, if healthy-fps runs are already ~0 falls, the head's
+headroom is small — spend effort on fps stability first.
 
 ## M5 — Stretch / opportunistic (attempt when M1-M4 land)
 
