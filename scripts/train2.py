@@ -103,7 +103,8 @@ META = {
 if META_FROM and os.path.exists(META_FROM):
     _base = json.load(open(META_FROM))
     for _k in ("K", "H", "W", "crop", "fps", "conv", "fc",
-               "win_pre", "win_post", "notyet_lo", "notyet_hi", "notyet_w", "cond"):
+               "win_pre", "win_post", "notyet_lo", "notyet_hi", "notyet_w", "cond",
+               "label_shift_ms"):
         if _k in _base:
             META[_k] = _base[_k]
     if not ARCH_SET and "arch" in _base:      # a retrain of a film model must stay film
@@ -197,6 +198,17 @@ if FILM and NEG_NPZ:
 # SLIDE-LOCK (once it slides it sees itself crouched and keeps sliding, never jumps pits). A short
 # cap labels only the slide ONSET so the model reacts to OBSTACLES, not its own crouch.
 SLIDE_SPAN_CAP = float(_farg("--slide-span-cap", 3.0))
+# --label-shift-ms: shift key-event timestamps EARLIER by this many ms at load time, BEFORE any
+# labeling windows are computed (live analysis: ~89% of hits are "fired-but-hit", the action lands
+# ~50-100ms late — earlier onsets teach earlier fires). This is a window OFFSET, deliberately NOT
+# a win_pre/notyet retune (that experiment is a known failure — do not touch those). Press and the
+# implied release shift together (`dur` is relative), so hold durations are preserved. Positive =
+# earlier; default 0.0 = today's exact behavior (timestamps never touched). Inherited via
+# --meta-from like the other labeling knobs; an explicit flag overrides.
+LABEL_SHIFT_MS = float(_farg("--label-shift-ms", META.get("label_shift_ms", 0.0)))
+META["label_shift_ms"] = LABEL_SHIFT_MS        # provenance in the saved *_meta.json
+if LABEL_SHIFT_MS:
+    print(f"label-shift: key events shifted {LABEL_SHIFT_MS:.0f} ms EARLIER", flush=True)
 # per-run reward multiplier, e.g. `--run-weight demo4=0.5` to down-weight the dominant anchor.
 # Repeatable; applied AFTER the human floor so a factor <1.0 actually bites. Names may omit the
 # `demo` prefix (`--run-weight 4=0.5`).
@@ -327,6 +339,11 @@ for ri, rdir in enumerate(runs):
     fm = json.load(open(os.path.join(rdir, "frames.json")))
     frames = sorted(fm["frames"], key=lambda f: f["idx"])
     keys = json.load(open(os.path.join(rdir, "keys.json")))
+    if LABEL_SHIFT_MS:
+        # one shift at the single load point so EVERY consumer below (positive labels,
+        # notyet windows, slide-span ends) sees the same earlier timeline; dur untouched.
+        for k in keys:
+            k["t"] -= LABEL_SHIFT_MS / 1000.0
     ts = np.array([f["t"] for f in frames])
     if len(ts) > 1:
         frame_dts.append(np.diff(ts))

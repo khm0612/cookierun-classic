@@ -15,6 +15,19 @@ _DIGIT_SIZE = (32, 48)
 _DIGIT_ACCEPT = 0.35
 _DIGIT_MARGIN = 0.03
 
+# Result-screen coin-field hardening (2026-07-13 offline audit of the result_r*.jpg
+# corpus): ~20% of live run results misread — reads-as-0 plus wrong numbers (observed
+# live: 11,411 for a ~6-digit total). Reproduced offline: a fixed crop that CLIPS the
+# digit row (panel displaced mid entry/bounce animation, or a longer total) still
+# "reads" as a confident smaller/different number (108,963 -> 8963 / 408963 / 1113063
+# on shifted ROIs). Defenses: read a slightly GROWN crop, and VETO any read whose ink
+# touches the crop border (a clipped row must be unreadable, never a wrong number).
+_RESULT_COINS_MAX = 400_000     # > the ~280k observed per-run coin ceiling (x2 incl.)
+_RESULT_EDGE_PX = 3
+_RESULT_GROW = (40, 12, 8, 24)  # left, right, up, down — measured on the audit corpus:
+                                # stays inside the bonus icons (~x1810) and the dashed
+                                # separators (~y710 / ~y890) around the coins row
+
 
 class TemplateMatcher:
     def __init__(self, templates_dir: str):
@@ -133,14 +146,33 @@ def _digit_boxes(crop) -> list[tuple[int, int, int, int]]:
     return sorted(boxes)
 
 
-def _read_int_digit_templates(frame, region, templates_dir: str) -> "int | None":
+def _read_int_digit_templates(frame, region, templates_dir: str,
+                              edge_px: int = 0) -> "int | None":
     templates = _load_digit_templates(templates_dir)
     if not templates:
         return None
     crop = region.crop(frame)
     mask = _digit_mask(crop)
+    boxes = _digit_boxes(crop)
+    if edge_px and boxes:
+        # Ink touching the crop border inside the digit row's band means the value may
+        # be CLIPPED (panel mid-animation / more digits than the ROI fits). A clipped
+        # row read "successfully" is a silently-wrong number -> refuse instead. Checked
+        # on the raw MASK, not the boxes: a near-edge sliver of a clipped digit can fall
+        # below the component-size floor and vanish from `boxes` while its ink still
+        # hugs the border.
+        ch, cw = mask.shape[:2]
+        top = min(y for _, y, _, _ in boxes)
+        bot = max(y + h for _, y, _, h in boxes)
+        lo = min(x for x, _, _, _ in boxes)
+        hi = max(x + w for x, _, w, _ in boxes)
+        yband = mask[max(0, top - 2):min(ch, bot + 2)]
+        xband = mask[:, max(0, lo - 2):min(cw, hi + 2)]
+        if (yband[:, :edge_px].any() or yband[:, cw - edge_px:].any()
+                or xband[:edge_px].any() or xband[ch - edge_px:].any()):
+            return None
     digits = []
-    for x, y, w, h in _digit_boxes(crop):
+    for x, y, w, h in boxes:
         norm = _normalize_digit(mask[y:y + h, x:x + w])
         if norm is None:
             continue
@@ -215,7 +247,30 @@ def read_mystery_boxes(frame, cfg) -> int:
     return min(val, 3)
 
 
+def _grown_results_region(region, frame):
+    """The coins ROI grown by _RESULT_GROW (clamped to the frame) so a result panel
+    displaced by its entry/bounce animation — or a 7-digit total — still lands fully
+    inside the crop; the edge-clip veto then guarantees a clipped row is never read."""
+    from .config import Region
+    gl, gr, gu, gd = _RESULT_GROW
+    fh, fw = frame.shape[:2]
+    x0, y0 = max(0, region.x - gl), max(0, region.y - gu)
+    x1 = min(fw, region.x + region.w + gr)
+    y1 = min(fh, region.y + region.h + gd)
+    return Region(x0, y0, x1 - x0, y1 - y0)
+
+
 def read_results(frame, cfg) -> dict:
-    coins = read_int(frame, cfg.regions["results_coins"], cfg.templates_dir) or 0
+    # Coins: template-only read on the GROWN crop with the edge-clip veto + a
+    # plausibility cap. No Tesseract fallback for this field: it cannot apply the veto,
+    # and a clipped crop is exactly when it returns a confident wrong number (the
+    # binary is absent on the farm box anyway, so the fallback only ever produced 0s
+    # here). An unreadable/implausible coins field returns 0 -> read_run_result's
+    # settle loop keeps polling and flags UNREAD, never counts garbage.
+    grown = _grown_results_region(cfg.regions["results_coins"], frame)
+    coins = _read_int_digit_templates(frame, grown, cfg.templates_dir,
+                                      edge_px=_RESULT_EDGE_PX)
+    if coins is not None and coins > _RESULT_COINS_MAX:
+        coins = None
     ingredients = read_int(frame, cfg.regions["results_ingredients"], cfg.templates_dir) or 0
-    return {"coins": coins, "ingredients": ingredients}
+    return {"coins": coins or 0, "ingredients": ingredients}

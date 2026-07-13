@@ -21,6 +21,7 @@ LearnedAgent unchanged (arch small_cnn, no cond).
 
 Usage: python scripts/train_iql.py [epochs] [--runs csv] [--encoder-init PATH]
        [--gamma 0.995] [--tau 0.7] [--beta 3.0] [--out-prefix iql]
+       [--pit-r -4.0] [--pit-spread 1.0] [--pit-oversample 1]
 """
 import os, json, sys, glob, time
 from _runtime import DATA
@@ -56,6 +57,14 @@ HIT_R, DEATH_R, LIVE_R = -1.0, -5.0, 0.01
 # clean-run objective cares about most (why IQL-1 never learned pits). Falls are mined
 # offline via the fixed-position "5 for 1 Pit Lift" revive-prompt template.
 PIT_R = float(_farg("--pit-r", -4.0))
+# Seconds before a detected fall over which PIT_R is spread. Applied at reward-construction
+# time (below), NOT baked into cache_pits.npy — the cache stores raw pit frame indices, so
+# one cache serves every spread value.
+PIT_SPREAD = float(_farg("--pit-spread", 1.0))
+# Duplicate the transitions inside pit-spread windows N times in the epoch index pool
+# (1 = off). Q/V/policy all draw batches from that one pool, so the critics see the same
+# oversampling as the actor — least-invasive for the GPU-resident gather pipeline.
+PIT_OVERSAMPLE = max(int(_farg("--pit-oversample", 1)), 1)
 torch.manual_seed(0)
 
 meta = json.load(open(os.path.join(BASE, "demo", "model_meta.json")))
@@ -153,7 +162,7 @@ def hit_frames(ts, hp):
     return hits
 
 
-imgs_all, act_all, rew_all, run_start = [], [], [], []
+imgs_all, act_all, rew_all, run_start, pit_win_all = [], [], [], [], []
 offset = 0
 for rdir in run_dirs:
     fm = json.load(open(os.path.join(rdir, "frames.json")))
@@ -193,8 +202,9 @@ for rdir in run_dirs:
     # penalize the frames LEADING INTO the fall (the prompt shows ~0.5-1s after the miss;
     # the mistimed/missing jump happened ~0.5s earlier) so credit lands on the decision
     for pi in pidx:
-        lo = np.searchsorted(ts, ts[pi] - 1.0)
+        lo = np.searchsorted(ts, ts[pi] - PIT_SPREAD)
         rew[lo:pi + 1] += PIT_R / max(pi + 1 - lo, 1)
+        pit_win_all.append(np.arange(lo, pi + 1, dtype=np.int64) + offset)
     rew[-1] += DEATH_R                     # run end = death (or the human stopped: close enough)
     print(f"  {os.path.basename(rdir)}: {n} frames | {len(hidx)} hits | {len(pidx)} PIT FALLS | "
           f"actions {dict(zip(CLASSES, np.bincount(act, minlength=3).tolist()))}", flush=True)
@@ -259,10 +269,19 @@ opt_q = torch.optim.Adam(list(q1.parameters()) + list(q2.parameters()), 3e-4)
 opt_v = torch.optim.Adam(vf.parameters(), 3e-4)
 opt_p = torch.optim.Adam(pi.parameters(), 3e-4)
 print(f"IQL: gamma={GAMMA} tau={TAU} beta={BETA} epochs={EPOCHS} "
+      f"pit_spread={PIT_SPREAD} pit_oversample={PIT_OVERSAMPLE} "
       f"encoder={'ssl' if ENC else 'scratch'}", flush=True)
 
 BATCH = 256
 valid = idx_all[~term_g]                    # transitions with a successor
+if PIT_OVERSAMPLE > 1 and pit_win_all:
+    # np.unique: a frame in overlapping windows (possible when PIT_SPREAD > the 4s mining
+    # refractory) still gets exactly N total copies
+    extra = torch.from_numpy(np.unique(np.concatenate(pit_win_all))).to(dev)
+    extra = extra[~term_g[extra]]           # same no-successor rule as `valid`
+    valid = torch.cat([valid] + [extra] * (PIT_OVERSAMPLE - 1))
+    print(f"pit oversample x{PIT_OVERSAMPLE}: {len(extra)} pre-fall transitions "
+          f"duplicated -> pool {len(valid)}", flush=True)
 for ep in range(EPOCHS):
     perm = valid[torch.randperm(len(valid), device=dev)]
     tot_q = tot_v = tot_p = 0.0

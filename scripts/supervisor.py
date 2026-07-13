@@ -9,6 +9,7 @@ import subprocess, sys, time
 from _runtime import ROOT
 
 SCRIPT = ROOT / "scripts" / "ai_farm.py"
+REFRESH_EXIT = 17   # ai_farm's "emulator degraded — refresh me" exit code (see ai_farm.py)
 
 
 def main(target: int = 15) -> int:
@@ -32,6 +33,17 @@ def main(target: int = 15) -> int:
                 completed += 1
         rc = p.wait()
         done += completed
+        if rc == REFRESH_EXIT:
+            # ai_farm tripped the fps-degradation check at a run boundary. The refresh
+            # itself (ldconsole quit/launch + boot poll + game start + window fix) is
+            # monitor.py's job — it owns this process, catches this code, refreshes the
+            # emulator, and relaunches us for the remaining runs. NOT a failure: the
+            # completed runs above were already counted from their >> RESULT: lines.
+            # Standalone use (no monitor) simply ends the batch here with `done` banked.
+            print(f"[sup] ai_farm requested an EMULATOR REFRESH (rc={rc}); "
+                  f"{done}/{target} done - exiting {REFRESH_EXIT} for the monitor",
+                  flush=True)
+            return REFRESH_EXIT
         if rc == 0 and completed >= want:
             break
         if completed == 0:

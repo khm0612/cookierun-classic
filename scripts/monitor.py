@@ -59,6 +59,20 @@ MARGIN_OK = float(os.environ.get("MONITOR_MARGIN_OK", "3.0"))
 GRAB_FAILS_BEFORE_RECONNECT = 3
 MAX_SUP_RELAUNCH = 3        # bounded so a truly-broken emulator can't loop forever
 
+# --- emulator refresh (fps-degradation recovery; see refresh_emulator) ---
+REFRESH_RC = 17             # ai_farm/supervisor "emulator degraded" exit code
+MAX_EMU_REFRESH = 2         # refreshes per batch: a machine still slow after 2 fresh
+                            # boots has a different problem — stop cycling the emulator
+LDCONSOLE = r"C:\LDPlayer\LDPlayer14\ldconsole.exe"
+LD_INDEX = "0"              # `ldconsole list2` -> `0,LDPlayer,...`
+GAME_ACTIVITY = "com.devsisters.crg/com.devsisters.CookieRunForKakao.OvenbreakX"
+BOOT_TIMEOUT_S = 240        # sys.boot_completed poll cap (~60-90s typical). NEVER use
+                            # `adb wait-for-device` on the 5555 transport — it can hang.
+LD_WINDOW_POS = (3520, 60, 1600, 930)   # known-good capture geometry (fix_window.py)
+NEWS_X_TAP = (2255, 148)    # News-popup X (adb coords). With NO popup up this exact
+                            # spot is the friends-list heart — so the tap is GATED, see
+                            # _dismiss_startup_popups (never blind-tap it).
+
 # While we're solving a card, drop a flag so farm.py's nav (which sometimes fails to match the
 # card template on its dxcam frame) never sends BACK on the card screen — a stray BACK can forfeit
 # the card and walk the app out to the Android launcher (observed 2026-07-05, 'sliding card' wedge).
@@ -244,6 +258,155 @@ def dismiss_modal(matcher, template: str, confirm_xy, label: str) -> None:
         _clear_card_flag()
 
 
+def _reposition_ld_window(emit) -> bool:
+    """Move the LDPlayer window to the known-good capture spot and front it (inlined from
+    the manual fix_window.py routine). A fresh LDPlayer boots at a drifted position/size;
+    dxcam captures the DESKTOP window, so geometry must be restored BEFORE the relaunched
+    ai_farm recalibrates its game-area. Also jiggles the mouse first — a sleeping display
+    starves dxcam of frames entirely."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.SetProcessDPIAware()
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _):
+            if user32.IsWindowVisible(hwnd):
+                buf = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(hwnd, buf, 256)
+                if buf.value == "LDPlayer":     # EnumWindows by exact title (FindWindow flaked)
+                    found.append(hwnd)
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        if not found:
+            emit("[refresh] no visible 'LDPlayer' window found to reposition")
+            return False
+        user32.mouse_event(1, 1, 0, 0, 0)       # wake the display
+        user32.mouse_event(1, -1, 0, 0, 0)
+        user32.MoveWindow(found[0], *LD_WINDOW_POS, True)
+        user32.SetForegroundWindow(found[0])
+        time.sleep(0.5)
+        emit(f"[refresh] LDPlayer window -> {LD_WINDOW_POS} + fronted")
+        return True
+    except Exception as exc:
+        emit(f"[refresh] window reposition failed: {exc!r}")
+        return False
+
+
+def _find_close_multiscale(frame, matcher):
+    """Find an event/News-popup X on an ADB frame. The close/close2 templates were cropped
+    from nav's dxcam frames (~0.5-0.7x the 2560px adb width), so the matcher's single-scale
+    match misses them on adb grabs (the league_results lesson) — search a few downscales of
+    the frame and map the best hit back to adb coords. Returns (score, x, y) or None."""
+    best = None
+    for name in ("close", "close2"):
+        tpl = matcher._templates.get(name)
+        if tpl is None:
+            continue
+        for s in (0.44, 0.5, 0.56, 0.62, 0.7, 0.8, 1.0):
+            small = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            if gray.shape[0] < tpl.shape[0] or gray.shape[1] < tpl.shape[1]:
+                continue
+            res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
+            _, mv, _, ml = cv2.minMaxLoc(res)
+            if mv >= 0.80 and (best is None or mv > best[0]):
+                best = (float(mv), int((ml[0] + tpl.shape[1] / 2) / s),
+                        int((ml[1] + tpl.shape[0] / 2) / s))
+    return best
+
+
+def _dismiss_startup_popups(matcher, emit) -> bool:
+    """Conditionally clear the post-launch News/event popup — NEVER blind-tap: with no
+    popup up, the News-X spot (2255,148) is the friends-list heart button. Ladder per
+    grab: menu Play visible = clean, done; a card = leave it (the watch loop solves
+    cards); League Results = the existing banner-gated dismiss; a matched close-X = tap
+    the MATCH; only when the screen has settled unrecognized (attempt >= 3, Play absent)
+    fall back to ONE fixed-point News-X tap. Anything still left is fine — the relaunched
+    ai_farm's ensure_running clears reward-popup gauntlets as part of normal nav."""
+    tapped_fixed = False
+    for attempt in range(6):
+        f = grab()
+        if f is None:
+            time.sleep(2.0)
+            continue
+        if matcher.present(f, "play", 0.72):
+            emit("[refresh] menu Play visible — popup layer clear")
+            return True
+        if matcher.present(f, "cardgame", CARD_THRESH):
+            emit("[refresh] card game up — leaving it to the watch loop")
+            return True
+        if matcher.present(f, "league_results", 0.85):
+            dismiss_modal(matcher, "league_results", (1280, 1210), "LEAGUE RESULTS")
+            continue
+        hit = _find_close_multiscale(f, matcher)
+        if hit is not None:
+            emit(f"[refresh] popup X matched at ({hit[1]},{hit[2]}) score {hit[0]:.2f} — tapping it")
+            tap(hit[1], hit[2])
+        elif attempt >= 3 and not tapped_fixed:
+            tapped_fixed = True
+            save_card(f, f"refresh_{attempt}")     # audit frame: what did we tap on?
+            emit(f"[refresh] settled unrecognized + Play absent — single gated News-X tap at {NEWS_X_TAP}")
+            tap(*NEWS_X_TAP)
+        time.sleep(2.5)
+    emit("[refresh] not on a clean menu after popup pass — leaving the rest to ai_farm's nav")
+    return False
+
+
+def refresh_emulator(emit) -> bool:
+    """Full unattended LDPlayer refresh — the proven RAM-overflow recovery procedure
+    (2026-07-06) + tonight's manual fps fix, automated: ldconsole quit -> launch -> poll
+    sys.boot_completed via `adb connect` + getprop (NEVER `adb wait-for-device`: it hangs
+    on the 5555 transport) -> `am start` the game (it does NOT auto-start; boot focus is
+    the LDPlayer launcher) -> reposition + front the window -> conditionally dismiss the
+    News popup. Uses ONLY ldconsole/adb/win32 — never dxcam: the relaunched ai_farm
+    re-initializes capture in its fresh process, and that is what resumes play. Returns
+    False if the emulator never reached boot_completed (caller falls back to the existing
+    bounded failure machinery)."""
+    emit(f"[refresh] EMULATOR REFRESH: ldconsole quit/launch --index {LD_INDEX}")
+    try:
+        subprocess.run([LDCONSOLE, "quit", "--index", LD_INDEX], capture_output=True, timeout=30)
+    except Exception as exc:
+        emit(f"[refresh] ldconsole quit failed: {exc!r}")
+    time.sleep(6.0)                                # Ld9BoxHeadless exits ~3s after quit
+    try:
+        subprocess.run([LDCONSOLE, "launch", "--index", LD_INDEX], capture_output=True, timeout=30)
+    except Exception as exc:
+        emit(f"[refresh] ldconsole launch failed: {exc!r}")
+        return False
+    t0 = time.time()
+    booted = False
+    while time.time() - t0 < BOOT_TIMEOUT_S:
+        try:
+            subprocess.run(["adb", "connect", SERIAL], capture_output=True, timeout=15)
+            out = _adb("shell", "getprop", "sys.boot_completed", timeout=10)
+            if out.stdout and out.stdout.strip() == b"1":
+                booted = True
+                break
+        except Exception:
+            pass
+        time.sleep(5.0)
+    if not booted:
+        emit(f"[refresh] emulator did NOT boot within {BOOT_TIMEOUT_S}s — refresh FAILED")
+        return False
+    emit(f"[refresh] booted in {time.time() - t0:.0f}s — starting the game")
+    try:
+        _adb("shell", "am", "start", "-n", GAME_ACTIVITY, timeout=20)
+    except Exception as exc:
+        emit(f"[refresh] am start failed: {exc!r}")
+        return False
+    _reposition_ld_window(emit)
+    emit("[refresh] waiting 40s for the game to reach the title/menu")
+    time.sleep(40.0)
+    _dismiss_startup_popups(TemplateMatcher(TEMPLATES), emit)
+    _reposition_ld_window(emit)                    # re-assert geometry+focus right before relaunch
+    emit("[refresh] refresh complete — relaunching the farm")
+    return True
+
+
 def _kill_stray_farm() -> None:
     """Kill any orphaned supervisor.py / ai_farm.py python processes before a (re)launch.
     Windows does not reap a dead parent's children, so if the supervisor ever dies with its
@@ -271,6 +434,9 @@ def _pump_supervisor(target: int) -> None:
     complete), so a slow-but-advancing batch is never abandoned prematurely."""
     _sup["target"] = target
     no_progress = 0
+    refreshes = 0            # emulator refreshes used this batch (capped MAX_EMU_REFRESH)
+    fps_check_off = False    # after the cap: relaunch with AIFARM_FPS_MIN=0 so the batch
+                             # finishes degraded-but-whole instead of churning 2-run chunks
     try:
         logf = open(SUP_LOG, "a", buffering=1)
     except Exception:
@@ -291,10 +457,12 @@ def _pump_supervisor(target: int) -> None:
             done_before = _sup["done"]
             emit(f"[mon-sup] launching supervisor for {remaining} run(s) "
                  f"({_sup['done']}/{target} done, no-progress relaunch {no_progress}/{MAX_SUP_RELAUNCH})")
+            env = dict(os.environ, AIFARM_FPS_MIN="0") if fps_check_off else None
             try:
                 p = subprocess.Popen([sys.executable, "-u", SUP_SCRIPT, str(remaining)],
                                      cwd=str(ROOT), stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                     env=env)
             except Exception as exc:
                 emit(f"[mon-sup] could not launch supervisor: {exc}")
                 break
@@ -308,6 +476,25 @@ def _pump_supervisor(target: int) -> None:
             _sup["proc"] = None
             if _sup["done"] >= target or _STOP.is_set():
                 break
+            if rc == REFRESH_RC:
+                # fps-degradation handoff from ai_farm (via supervisor). A refresh
+                # relaunch is NOT a failure: skip the no-progress accounting entirely
+                # (the >= 2 runs that tripped the check were already counted above).
+                if refreshes < MAX_EMU_REFRESH:
+                    refreshes += 1
+                    emit(f"[mon-sup] FPS-DEGRADED exit (rc={rc}) -> emulator refresh "
+                         f"{refreshes}/{MAX_EMU_REFRESH}")
+                    if not refresh_emulator(emit):
+                        emit("[mon-sup] refresh FAILED (emulator never booted) — "
+                             "relaunching anyway; a dead emulator yields zero-run "
+                             "attempts and the existing bounded budgets stop the batch")
+                    emit(f"[mon-sup] resuming batch: {target - _sup['done']} run(s) left")
+                else:
+                    fps_check_off = True
+                    emit(f"[mon-sup] refresh budget ({MAX_EMU_REFRESH}) exhausted — "
+                         "relaunching with AIFARM_FPS_MIN=0 (finish the batch degraded "
+                         "rather than cycling the emulator)")
+                continue
             no_progress = 0 if _sup["done"] > done_before else no_progress + 1
             if no_progress > MAX_SUP_RELAUNCH:
                 emit(f"[mon-sup] supervisor made no progress across {no_progress} relaunch(es) "

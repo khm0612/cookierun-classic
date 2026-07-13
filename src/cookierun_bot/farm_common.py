@@ -3,6 +3,7 @@ template polling, result-screen reading, and the boost-gate dataclasses.
 
 Leaf module — imported by farm_cards, farm_boosts, and farm; imports nothing from them."""
 from __future__ import annotations
+from collections import Counter
 from dataclasses import dataclass
 import os
 import time
@@ -171,14 +172,25 @@ def wait_for_result_frame(dev, matcher, timeout_s: float = 8.0,
 
 def read_run_result(dev, cfg, matcher, timeout_s: float = 30.0,
                     poll_s: float = 0.5, stable_reads: int = 3,
-                    settle_timeout_s: float = 14.0, sleep=time.sleep,
+                    settle_timeout_s: float = 14.0, min_settle_s: float = 5.0,
+                    sleep=time.sleep,
                     now=time.monotonic, should_stop=None) -> dict:
     """Read the post-run Result screen. Returns {coins, ingredients, read_ok}. `read_ok`
     is False when we never got a genuine Result frame (a card game / level-up modal /
     Mystery-Box screen can pre-empt or hide it — observed live: 3/15 runs returned 0 not
     because the digits misread but because the Result screen was gone by the time we read).
     A completed run cannot really yield 0 coins, so a 0 read is reported as read_ok=False —
-    the caller should treat it as UNCOUNTED (banked, uncounted), never as a real 0."""
+    the caller should treat it as UNCOUNTED (banked, uncounted), never as a real 0.
+
+    The Result coin tally ANIMATES (counts up / pauses while bonus icons pop in), so a
+    stable streak alone is NOT settled: the 2026-07-13 batch returned 6,267 / 8,609 /
+    5,981 / 69,662 for runs whose audit frames (saved ~1s later) show settled 96,184 /
+    96,295 / 95,812 / 116,831 — the old 3-stable exit locked mid-tally hold values
+    ~1.5s in. The audit frames also show the tally settles within ~2-3s, so the early
+    exit now additionally requires `min_settle_s` (5s) on the Result screen. If no
+    stable streak ever clears the gate, the timeout return is the MODAL positive read
+    (most-seen (coins, ingredients), ties to the largest), replacing keep-the-max —
+    one transient over-read can no longer outrank many agreeing genuine reads."""
     def _out(d, ok):
         return {"coins": d["coins"], "ingredients": d["ingredients"], "read_ok": bool(ok)}
 
@@ -187,7 +199,11 @@ def read_run_result(dev, cfg, matcher, timeout_s: float = 30.0,
         sleep=sleep, now=now, should_stop=should_stop)
     if frame is None:
         return {"coins": 0, "ingredients": 0, "read_ok": False}
-    best = last = read_results(frame, cfg)
+    t_result = now()
+    last = read_results(frame, cfg)
+    reads = Counter()
+    if last["coins"] > 0 or last["ingredients"] > 0:
+        reads[(last["coins"], last["ingredients"])] += 1
     streak = 1
     polls = max(1, int(settle_timeout_s / max(poll_s, 0.01)))
     for _ in range(polls):
@@ -198,21 +214,21 @@ def read_run_result(dev, cfg, matcher, timeout_s: float = 30.0,
         if frame is None or not matcher.find(frame, _RESULT_BUTTON, 0.82):
             continue
         current = read_results(frame, cfg)
-        # keep the strictly-best read by (coins, then ingredients) — a later frame with
-        # equal coins but a transiently-misread LOWER ingredients count must not overwrite
-        # a better earlier read (which could wrongly flip read_ok to False).
-        if (current["coins"], current["ingredients"]) > (best["coins"], best["ingredients"]):
-            best = current
+        if current["coins"] > 0 or current["ingredients"] > 0:
+            reads[(current["coins"], current["ingredients"])] += 1
         if current == last and (current["coins"] > 0 or current["ingredients"] > 0):
             streak += 1
-            if streak >= stable_reads:
+            if streak >= stable_reads and now() - t_result >= min_settle_s:
                 # read_ok is COIN validity: a completed run never truly banks 0 coins, so a
                 # settled coins=0 (even with valid ingredients) is an UNREAD coin read.
                 return _out(current, current["coins"] > 0)
         else:
             last = current
             streak = 1
-    return _out(best, best["coins"] > 0)
+    if reads:
+        coins, ingredients = max(reads, key=lambda k: (reads[k], k))
+        return _out({"coins": coins, "ingredients": ingredients}, coins > 0)
+    return _out(last, False)
 
 
 def read_wallet(dev, cfg, matcher, tries: int = 8, should_stop=None,

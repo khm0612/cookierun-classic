@@ -98,6 +98,15 @@ if _JUMP_CAP != 0.60:
 _SLIDE_CONF = os.environ.get("AIFARM_SLIDE_CONF")
 if _SLIDE_CONF is not None:
     print(f"slide-gate OVERRIDE: {_SLIDE_CONF} (AIFARM_SLIDE_CONF)", flush=True)
+# EMULATOR-REFRESH exit: LDPlayer degrades over long batches (measured capture fps
+# 70 -> 37 over ~26h) and low fps directly worsens the bot's reaction timing. When the
+# measured decision fps stays below AIFARM_FPS_MIN for 2 CONSECUTIVE runs, exit with
+# REFRESH_EXIT at the run boundary — supervisor.py hands the code up and monitor.py
+# does a full ldconsole quit+launch refresh, then relaunches us for the remaining runs
+# (a fresh process also re-initializes dxcam cleanly). AIFARM_FPS_MIN=0 disables it.
+REFRESH_EXIT = 17            # unused elsewhere (2 = the blind-run exit below)
+FPS_MIN = float(os.environ.get("AIFARM_FPS_MIN", "45"))
+_low_fps = 0                 # consecutive sub-FPS_MIN runs
 
 
 def _mk_agent(model_name, jump_conf):
@@ -386,6 +395,21 @@ for run_no in range(1, MAX_RUNS + 1):
               f"screen pre-empted it); coins were banked but can't be counted. | session "
               f"total: {totals['coins']} coins / {totals['runs']} runs ({unread} unread)",
               flush=True)
+
+    # EMULATOR-REFRESH check — run boundary ONLY (the >> RESULT: line above is already
+    # out, so the supervisor has counted this run; nothing is ever cut off mid-run).
+    # Two consecutive slow runs = a degraded emulator, not one unlucky run. On the LAST
+    # run there is nothing left to farm — finish normally instead of forcing a refresh.
+    if FPS_MIN > 0 and fps < FPS_MIN:
+        _low_fps += 1
+    else:
+        _low_fps = 0
+    if _low_fps >= 2 and run_no < MAX_RUNS:
+        print(f">> FPS-DEGRADED: fps {fps:.0f} < {FPS_MIN:.0f} for {_low_fps} consecutive "
+              f"runs — exiting {REFRESH_EXIT} for an emulator refresh", flush=True)
+        diag.close()
+        dev.stop()
+        sys.exit(REFRESH_EXIT)
 
 diag.close()
 walletN = farm.read_wallet(dev, cfg, matcher)   # best-effort end balance (None if not on menu)
