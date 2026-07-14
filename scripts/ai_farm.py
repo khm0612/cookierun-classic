@@ -152,7 +152,9 @@ if _HAZ:
     _hmeta = _hpath[:-3] + "_meta.json"
     agent = HazardTrigger(agent, _hpath, _hmeta,
                           thr=float(os.environ.get("AIFARM_HAZARD_THR", "0.7")),
-                          check_every=int(os.environ.get("AIFARM_HAZARD_EVERY", "3")))
+                          check_every=int(os.environ.get("AIFARM_HAZARD_EVERY", "3")),
+                          confirm_reads=int(os.environ.get("AIFARM_HAZARD_CONFIRM", "1")),
+                          max_per_episode=int(os.environ.get("AIFARM_HAZARD_MAXJUMP", "2")))
     print(f"HAZARD trigger: {os.path.basename(_hpath)} @ thr "
           f"{os.environ.get('AIFARM_HAZARD_THR', '0.7')}", flush=True)
 print(f"backend: {type(dev).__name__} | dxcam: {getattr(dev,'_use_dx',None)} | model: {agent._device}", flush=True)

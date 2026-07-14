@@ -27,7 +27,8 @@ from .learned import build_convs
 
 class HazardTrigger:
     def __init__(self, inner, hazard_path: str, meta_path: str, thr: float = 0.7,
-                 cooldown_s: float = 0.25, max_per_episode: int = 2, check_every: int = 3):
+                 cooldown_s: float = 0.25, max_per_episode: int = 2, check_every: int = 3,
+                 confirm_reads: int = 1):
         import torch
         self._torch = torch
         self.inner = inner
@@ -35,8 +36,13 @@ class HazardTrigger:
         self.K, self.H, self.W = int(meta["K"]), int(meta["H"]), int(meta["W"])
         self._crop = meta.get("crop", [0.1, 0.2, 1.0, 0.9])
         self._thr = float(thr)
-        self._cd_s = float(cooldown_s)
-        self._max_ep = int(max_per_episode)
+        self._cd_s = float(cooldown_s)          # also the DOUBLE-JUMP gap: p staying >= thr
+        self._max_ep = int(max_per_episode)     # 2 = allows the chained second tap per episode
+        # HYSTERESIS (idea #3): require N consecutive above-thr reads before the FIRST fire of
+        # an episode — false fires need N-in-a-row (rate falls ~geometrically) while a real
+        # approach (~1.5s of high P) barely notices. 1 = off (fire on the first read).
+        self._confirm = max(1, int(confirm_reads))
+        self._above = 0
         # LIVE FINDING (2026-07-14): running the head EVERY frame dropped fps 50->37, and low
         # fps is itself the dominant fall driver — a net loss. Throttle to every Nth frame; a
         # ~1.5s pit-approach window is ~50 frames, so every 3rd still gives ~17 looks.
@@ -108,6 +114,7 @@ class HazardTrigger:
         self._cd_until = 0.0
         self._ep_hits = 0
         self._below = 0
+        self._above = 0
         self._fcount = 0
         self.fires = 0
 
@@ -162,11 +169,18 @@ class HazardTrigger:
             p = self._infer_p_pit()
         if p < self._thr:
             self._below += 1
+            self._above = 0
             if self._below >= 3:                 # a lull ends the episode -> re-arm the budget
                 self._ep_hits = 0
             return d
         self._below = 0
+        self._above += 1
         now = time.monotonic()
+        # hysteresis: the FIRST fire of an episode needs `confirm` consecutive above-thr reads
+        # (kills one-off false spikes); the chained 2nd jump (ep_hits>=1, for wide pits) fires
+        # as soon as the cooldown clears while P stays high.
+        if self._ep_hits == 0 and self._above < self._confirm:
+            return d
         if now < self._cd_until or self._ep_hits >= self._max_ep or d.action == ACTION_JUMP:
             return d
         self._cd_until = now + self._cd_s
