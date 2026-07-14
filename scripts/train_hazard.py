@@ -15,7 +15,7 @@ Usage:
 from __future__ import annotations
 import os, sys, json, glob
 import numpy as np
-import torch, torch.nn as nn
+import torch, torch.nn as nn, torch.nn.functional as F
 from _runtime import DATA
 from cookierun_bot.policies.learned import build_convs
 
@@ -37,6 +37,10 @@ HAZARD_S = float(_farg("--hazard-s", 1.5))
 ENC_INIT = _farg("--enc-init", "iql3")
 VAL_FRAC = float(_farg("--val-frac", 0.25))
 OUT = _farg("--out", "hazard")
+# --focal G (default 0.0): focal-loss modulation of the per-sample BCE; 0.0 == plain BCE.
+FOCAL = float(_farg("--focal", 0.0))
+# --augment (flag, default off): train-only brightness jitter + 1-in-K temporal drop.
+AUGMENT = "--augment" in sys.argv[1:]
 torch.manual_seed(0)
 np.random.seed(0)
 
@@ -114,7 +118,30 @@ def stacks(imgs, idx):
     return imgs[ind]
 
 
+def augment_stacks(xb, rng):
+    """Train-only, shape-preserving aug on a (B,K,H,W) float tensor already in [0,1].
+
+    ONLY called under `if AUGMENT` so the default path draws ZERO rng and returns the
+    exact input tensor. Consumes rng in a fixed order: temporal-drop mask, drop slots,
+    brightness factors — all from the script's shared rng so runs stay deterministic.
+    """
+    B, Kc = int(xb.shape[0]), int(xb.shape[1])
+    # 1-in-K temporal drop: repeat the previous frame into one random slot (per sample).
+    if Kc >= 2:
+        drop = rng.random(B) < (1.0 / Kc)
+        slots = rng.integers(1, Kc, size=B)  # slot in [1, K-1] -> copies slot s-1
+        for bi in range(B):
+            if drop[bi]:
+                s = int(slots[bi])
+                xb[bi, s] = xb[bi, s - 1]
+    # brightness jitter: per-sample x * U(0.9, 1.1), clamped back to [0, 1].
+    fac = torch.from_numpy(rng.uniform(0.9, 1.1, size=B).astype(np.float32)).to(xb.device)
+    return (xb * fac[:, None, None, None]).clamp_(0.0, 1.0)
+
+
 def main():
+    print(f"[hazard] epochs={EPOCHS} hazard_s={HAZARD_S} enc_init={ENC_INIT} "
+          f"val_frac={VAL_FRAC} out={OUT} focal={FOCAL} augment={AUGMENT}", flush=True)
     dirs = sorted(glob.glob(os.path.join(BASE, "botrun_*")) +
                   glob.glob(os.path.join(BASE, "demo_self_*")) +
                   [os.path.join(BASE, r) for r in ("hf2", "hf3", "hf4")])
@@ -163,9 +190,21 @@ def main():
             xs = np.concatenate([stacks(train[ri][1], np.array([i])) for ri, i in bi])
             ys = np.array([train[ri][2][i] for ri, i in bi], np.float32)
             xb = torch.from_numpy(xs).to(dev).float().div_(255.0)
+            if AUGMENT:  # default off -> xb untouched, zero rng drawn
+                xb = augment_stacks(xb, rng)
             yb = torch.from_numpy(ys).to(dev)
             opt.zero_grad()
-            loss = lossf(net(xb), yb)
+            if FOCAL == 0.0:  # default -> EXACT original BCEWithLogitsLoss(pos_weight)
+                loss = lossf(net(xb), yb)
+            else:
+                logits = net(xb)
+                # per-sample BCE with the SAME pos_weight balancing as lossf (reduction='none'
+                # then .mean() is bit-identical to reduction='mean'); scale each by (1-p_t)^G.
+                bce = F.binary_cross_entropy_with_logits(
+                    logits, yb, pos_weight=pos_weight, reduction="none")
+                p = torch.sigmoid(logits)
+                p_t = p * yb + (1.0 - p) * (1.0 - yb)  # predicted prob of the true class
+                loss = (bce * (1.0 - p_t).pow(FOCAL)).mean()
             loss.backward(); opt.step()
             tot += loss.item() * len(bi)
         # ---- val: precision/recall at thresholds + AP ----
@@ -230,7 +269,8 @@ def main():
 
     torch.save(net.state_dict(), os.path.join(BASE, "demo", f"{OUT}.pt"))
     json.dump({"arch": "hazard", "K": K, "H": H, "W": W, "crop": CROP,
-               "conv": gmeta["conv"], "hazard_s": HAZARD_S, "enc_init": ENC_INIT},
+               "conv": gmeta["conv"], "hazard_s": HAZARD_S, "enc_init": ENC_INIT,
+               "focal": FOCAL, "augment": AUGMENT},
               open(os.path.join(BASE, "demo", f"{OUT}_meta.json"), "w"))
     print(f">> saved {OUT}.pt (+meta)", flush=True)
 

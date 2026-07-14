@@ -23,6 +23,7 @@ Usage: python scripts/train_iql.py [epochs] [--runs csv] [--encoder-init PATH]
        [--gamma 0.995] [--tau 0.7] [--beta 3.0] [--out-prefix iql]
        [--pit-r -4.0] [--pit-spread 1.0] [--pit-oversample 1]
        [--mask-hits 0.0] [--human-weight 1.0] [--min-quality]   # M2 selective imitation
+       [--nstep 1] [--cql-alpha 0.0]                            # M3 value-side (n-step + CQL)
 """
 import os, json, sys, glob, time
 from _runtime import DATA
@@ -79,6 +80,14 @@ MASK_HITS = float(_farg("--mask-hits", 0.0))
 HUMAN_WEIGHT = float(_farg("--human-weight", 1.0))
 MIN_QUALITY = "--min-quality" in sys.argv[1:]
 _HUMAN = ("hf2", "hf3", "hf4")
+# --- M3 value-side knobs (both default to a NO-OP so iql3 behaviour is bit-identical) ---
+#   --nstep N     : n-step Q-target. N=1 (default) keeps the exact 1-step target
+#                   q_tgt = r_i + GAMMA*V(s_{i+1}); N>1 bootstraps m = min(N, steps-to-run-end)
+#                   ahead so it never crosses a run boundary (precomputed below, guarded).
+#   --cql-alpha A : CQL conservative penalty A*(logsumexp_a Q(s,a) - Q(s,a_data)) on BOTH critics.
+#                   A=0.0 (default) => the term is skipped => Q-loss is bit-identical.
+NSTEP = max(int(_farg("--nstep", 1)), 1)
+CQL_ALPHA = float(_farg("--cql-alpha", 0.0))
 torch.manual_seed(0)
 
 meta = json.load(open(os.path.join(BASE, "demo", "model_meta.json")))
@@ -301,6 +310,7 @@ opt_p = torch.optim.Adam(pi.parameters(), 3e-4)
 print(f"IQL: gamma={GAMMA} tau={TAU} beta={BETA} epochs={EPOCHS} "
       f"pit_spread={PIT_SPREAD} pit_oversample={PIT_OVERSAMPLE} "
       f"mask_hits={MASK_HITS} human_weight={HUMAN_WEIGHT} min_quality={MIN_QUALITY} "
+      f"nstep={NSTEP} cql_alpha={CQL_ALPHA} "
       f"encoder={'ssl' if ENC else 'scratch'}", flush=True)
 
 BATCH = 256
@@ -313,6 +323,33 @@ if PIT_OVERSAMPLE > 1 and pit_win_all:
     valid = torch.cat([valid] + [extra] * (PIT_OVERSAMPLE - 1))
     print(f"pit oversample x{PIT_OVERSAMPLE}: {len(extra)} pre-fall transitions "
           f"duplicated -> pool {len(valid)}", flush=True)
+if NSTEP != 1:
+    # ---- M3 n-step returns (precomputed ONCE, numpy -> GPU) --------------------------------
+    # q_tgt[i] = Σ_{k=0}^{m-1} GAMMA^k r_{i+k} + GAMMA^m V(s_{i+m}),  m = min(NSTEP, run_end[i]-i)
+    # so the bootstrap frame i+m NEVER crosses a run boundary. The bootstrap is off the LAST
+    # in-run frame (mirrors the existing 1-step target, which likewise bootstraps V at the —
+    # possibly terminal — successor); the run-final DEATH_R reward is therefore captured through
+    # V(s_{i+m}), never summed directly, keeping the run-boundary semantics identical to 1-step.
+    # (Guarded by NSTEP != 1: with N=1 the epoch loop takes the original 1-step branch verbatim.)
+    _arange = np.arange(n, dtype=np.int64)
+    run_end = np.empty(n, np.int64)               # nearest terminal frame index at/after each frame
+    _nxt = n - 1
+    for _j in range(n - 1, -1, -1):
+        if is_term[_j]:
+            _nxt = _j
+        run_end[_j] = _nxt
+    _m = np.minimum(NSTEP, run_end - _arange).astype(np.int64)   # >=1 on non-terminals, 0 on terminals
+    nstep_boot = _arange + _m                                    # i+m, guaranteed <= run_end[i]
+    nstep_gpow = (GAMMA ** _m).astype(np.float32)                # GAMMA^m
+    _disc = np.zeros(n, np.float32)
+    for _k in range(NSTEP):
+        _sel = np.where(_k < _m)[0]                             # transitions whose window still reaches step k
+        _disc[_sel] += np.float32((GAMMA ** _k) * rew[_sel + _k])   # accumulate GAMMA^k * r_{i+k}
+    nstep_boot_g = torch.from_numpy(nstep_boot).to(dev)
+    nstep_disc_rew_g = torch.from_numpy(_disc).to(dev)
+    nstep_gpow_g = torch.from_numpy(nstep_gpow).to(dev)
+    print(f"n-step={NSTEP}: mean m={float(_m[~is_term].mean()):.2f} over "
+          f"{int((~is_term).sum())} non-terminal transitions", flush=True)
 for ep in range(EPOCHS):
     perm = valid[torch.randperm(len(valid), device=dev)]
     tot_q = tot_v = tot_p = 0.0
@@ -322,10 +359,16 @@ for ep in range(EPOCHS):
         s = stacks(i)
         a = act_g[i]
         r = rew_g[i]
-        sp = stacks(i + 1)
         with torch.no_grad():
-            vnext = vf(sp).squeeze(1)
-            q_tgt = r + GAMMA * vnext
+            if NSTEP != 1:
+                # n-step target: precomputed discounted reward sum + GAMMA^m V(s_{i+m}),
+                # m clamped so the bootstrap frame stays in-run (see the precompute above).
+                vnext = vf(stacks(nstep_boot_g[i])).squeeze(1)
+                q_tgt = nstep_disc_rew_g[i] + nstep_gpow_g[i] * vnext
+            else:                                          # default: exact 1-step target (unchanged)
+                sp = stacks(i + 1)
+                vnext = vf(sp).squeeze(1)
+                q_tgt = r + GAMMA * vnext
             qmin = torch.minimum(q1t(s).gather(1, a[:, None]).squeeze(1),
                                  q2t(s).gather(1, a[:, None]).squeeze(1))
         # V: expectile regression toward min target-Q
@@ -333,8 +376,15 @@ for ep in range(EPOCHS):
         lv = (torch.abs(TAU - (u < 0).float()) * u.pow(2)).mean()
         opt_v.zero_grad(); lv.backward(); opt_v.step()
         # Q: TD toward r + gamma V(s')
-        lq = F.mse_loss(q1(s).gather(1, a[:, None]).squeeze(1), q_tgt) + \
-             F.mse_loss(q2(s).gather(1, a[:, None]).squeeze(1), q_tgt)
+        q1a, q2a = q1(s), q2(s)                     # full Q(s,.) logits, reused by the CQL term
+        lq = F.mse_loss(q1a.gather(1, a[:, None]).squeeze(1), q_tgt) + \
+             F.mse_loss(q2a.gather(1, a[:, None]).squeeze(1), q_tgt)
+        if CQL_ALPHA != 0.0:
+            # CQL conservatism: push Q down on OOD actions via A*(logsumexp_a Q - Q(a_data)),
+            # added to BOTH critics (no extra forward — reuses q1a/q2a). A=0.0 => skipped.
+            cql = ((torch.logsumexp(q1a, dim=1) - q1a.gather(1, a[:, None]).squeeze(1)).mean()
+                 + (torch.logsumexp(q2a, dim=1) - q2a.gather(1, a[:, None]).squeeze(1)).mean())
+            lq = lq + CQL_ALPHA * cql
         opt_q.zero_grad(); lq.backward(); opt_q.step()
         # policy: advantage-weighted BC
         with torch.no_grad():
