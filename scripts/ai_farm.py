@@ -217,7 +217,15 @@ if not _HYBRID and os.path.exists(_HYB_FILE):
     if _hj.get("confs"):
         os.environ.setdefault("AIFARM_HYBRID_CONFS",
                               ",".join(str(c) for c in _hj["confs"]))
-    print(f"hybrid.json deploy: {_HYBRID} confs={_hj.get('confs')}", flush=True)
+    # DURABLE async-hazard deploy: {"hazard":"hazard","hazard_thr":0.7} in hybrid.json wraps the
+    # hybrid with the off-thread pit detector (validated 2026-07-14: ~1.5 falls/run vs 2.67
+    # baseline, fps-safe). env AIFARM_HAZARD still overrides; delete the key to revert.
+    if _hj.get("hazard"):
+        os.environ.setdefault("AIFARM_HAZARD", str(_hj["hazard"]))
+        if _hj.get("hazard_thr") is not None:
+            os.environ.setdefault("AIFARM_HAZARD_THR", str(_hj["hazard_thr"]))
+    print(f"hybrid.json deploy: {_HYBRID} confs={_hj.get('confs')} "
+          f"hazard={_hj.get('hazard')}", flush=True)
 if _HYBRID:
     from cookierun_bot.policies.hybrid_phase import HybridPhaseAgent
     _bn, _xn = [s.strip() for s in _HYBRID.split(",")]
