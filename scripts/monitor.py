@@ -33,6 +33,7 @@ import os
 import time
 import subprocess
 import threading
+import hashlib
 
 import numpy as np
 import cv2
@@ -50,6 +51,9 @@ TEMPLATES = str(ROOT / "templates")
 OUT_DIR = str(DATA / "ai_hits")
 SUP_LOG = str(ROOT / "supervisor.log")
 SUP_SCRIPT = str(ROOT / "scripts" / "supervisor.py")
+# ponytail: one stable owner per device also reaps a crashed predecessor across worktrees.
+_SESSION_ID = hashlib.sha256(SERIAL.casefold().encode()).hexdigest()[:16]
+_SESSION_ARG = f"--cookierun-session={_SESSION_ID}"
 POLL_S = 3.0
 CARD_THRESH = float(os.environ.get("MONITOR_CARD_THRESH", "0.85"))
 # per-round recheck threshold while solving
@@ -93,10 +97,36 @@ def _clear_card_flag() -> None:
 # supervise-mode shared state (updated by the supervisor pump thread, read by the watch loop)
 _sup = {"target": 0, "done": 0, "finished": False, "proc": None}
 _STOP = threading.Event()   # set on monitor shutdown so the pump won't relaunch mid-exit
+_REFRESH_PENDING = threading.Event()
+_CARD_SOLVER_LOCK = threading.Lock()
+_SUP_LAUNCH_LOCK = threading.Lock()
 
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _acquire_device_lock(path=None):
+    """Claim the emulator for one monitor process; closing the handle releases it."""
+    import tempfile
+    lock_path = os.fspath(path or os.path.join(tempfile.gettempdir(),
+                                               f"cookierun-monitor-{_SESSION_ID}.lock"))
+    fh = open(lock_path, "a+b")
+    if os.path.getsize(lock_path) == 0:
+        fh.write(b"0")
+        fh.flush()
+    fh.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        fh.close()
+        return None
+    return fh
 
 
 def _alert_user() -> None:
@@ -174,12 +204,27 @@ def save_card(frame, rnd) -> None:
 def _wait_for_manual_card_clear(matcher: TemplateMatcher) -> None:
     """Hold the farm on a low-confidence card board until the user clears it."""
     last_ping = 0.0
+    grab_fails = 0
     while True:
+        if _sup["finished"] or _STOP.is_set() or _REFRESH_PENDING.is_set():
+            _clear_card_flag()
+            log("card wait cancelled -- supervision/refresh is finishing")
+            return
         _set_card_flag()
         f = grab()
         if f is None:
+            grab_fails += 1
+            if grab_fails >= GRAB_FAILS_BEFORE_RECONNECT:
+                reconnect_adb()
+                grab_fails = 0
+            now = time.monotonic()
+            if now - last_ping > 20.0:
+                last_ping = now
+                _alert_user()
+                log("card wait capture unavailable -- protection remains armed")
             time.sleep(1.0)
             continue
+        grab_fails = 0
         if not matcher.present(f, "cardgame", CARD_THRESH_ACT):
             _clear_card_flag()
             log("low-confidence card cleared manually -- run resuming")
@@ -192,7 +237,7 @@ def _wait_for_manual_card_clear(matcher: TemplateMatcher) -> None:
         time.sleep(1.0)
 
 
-def solve_cardgame(matcher: TemplateMatcher) -> None:
+def _solve_cardgame(matcher: TemplateMatcher) -> None:
     """Solve rounds until the cardgame template is gone (or a safety cap is hit).
 
     High-confidence boards are tapped once per round. Low-confidence boards are fail-closed:
@@ -233,8 +278,14 @@ def solve_cardgame(matcher: TemplateMatcher) -> None:
         time.sleep(0.6)
         tap(*cj)
         time.sleep(4.0)                            # user rule: don't hurry, wait ~4s / round
-    _clear_card_flag()                             # gave up -> don't freeze nav on a stuck flag
-    log("card solve: hit round cap -- leaving it; the run continues regardless")
+    # Keep the veto armed: a capture outage is not evidence that the card screen disappeared.
+    log("card solve: hit round cap -- leaving card protection armed")
+
+
+def solve_cardgame(matcher: TemplateMatcher) -> None:
+    """Run the sole card-tap owner; emulator refresh waits for this critical section."""
+    with _CARD_SOLVER_LOCK:
+        _solve_cardgame(matcher)
 
 
 def dismiss_modal(matcher, template: str, confirm_xy, label: str) -> None:
@@ -256,6 +307,18 @@ def dismiss_modal(matcher, template: str, confirm_xy, label: str) -> None:
         log(f"{label} still present after 4 taps -- leaving it")
     finally:
         _clear_card_flag()
+
+
+def _dismiss_modal_safely(matcher, template: str, confirm_xy, label: str) -> bool:
+    """Serialize all monitor taps with emulator refresh and recheck after locking."""
+    with _CARD_SOLVER_LOCK:
+        if _REFRESH_PENDING.is_set():
+            return False
+        fresh = grab()
+        if fresh is None or not matcher.present(fresh, template, 0.85):
+            return False
+        dismiss_modal(matcher, template, confirm_xy, label)
+        return True
 
 
 def _reposition_ld_window(emit) -> bool:
@@ -407,6 +470,16 @@ def refresh_emulator(emit) -> bool:
     return True
 
 
+def _refresh_emulator_safely(emit) -> bool:
+    """Stop card solving before refreshing so taps cannot land on a rebooting emulator."""
+    _REFRESH_PENDING.set()
+    try:
+        with _CARD_SOLVER_LOCK:
+            return refresh_emulator(emit)
+    finally:
+        _REFRESH_PENDING.clear()
+
+
 def _kill_stray_farm() -> None:
     """Kill any orphaned supervisor.py / ai_farm.py python processes before a (re)launch.
     Windows does not reap a dead parent's children, so if the supervisor ever dies with its
@@ -418,7 +491,7 @@ def _kill_stray_farm() -> None:
         subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-             "Where-Object { $_.CommandLine -match 'ai_farm\\.py|supervisor\\.py' } | "
+             f"Where-Object {{ $_.CommandLine -match '--cookierun-session={_SESSION_ID}' }} | "
              "ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } "
              "catch {} }"],
             capture_output=True, timeout=20)
@@ -452,21 +525,34 @@ def _pump_supervisor(target: int) -> None:
 
     try:
         while _sup["done"] < target and not _STOP.is_set():
-            _kill_stray_farm()                        # never allow two farms on one emulator
             remaining = target - _sup["done"]
             done_before = _sup["done"]
             emit(f"[mon-sup] launching supervisor for {remaining} run(s) "
                  f"({_sup['done']}/{target} done, no-progress relaunch {no_progress}/{MAX_SUP_RELAUNCH})")
             env = dict(os.environ, AIFARM_FPS_MIN="0") if fps_check_off else None
-            try:
-                p = subprocess.Popen([sys.executable, "-u", SUP_SCRIPT, str(remaining)],
-                                     cwd=str(ROOT), stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                     env=env)
-            except Exception as exc:
-                emit(f"[mon-sup] could not launch supervisor: {exc}")
-                break
-            _sup["proc"] = p
+            with _SUP_LAUNCH_LOCK:
+                if _STOP.is_set():
+                    break
+                _kill_stray_farm()                    # never allow two farms on one emulator
+                if _STOP.is_set():
+                    break
+                try:
+                    p = subprocess.Popen([sys.executable, "-u", SUP_SCRIPT, str(remaining),
+                                          _SESSION_ARG],
+                                         cwd=str(ROOT), stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                         env=env)
+                except Exception as exc:
+                    emit(f"[mon-sup] could not launch supervisor: {exc}")
+                    break
+                _sup["proc"] = p
+                if _STOP.is_set():
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                    _sup["proc"] = None
+                    break
             for line in p.stdout:
                 line = line.rstrip()
                 emit(line)
@@ -484,7 +570,7 @@ def _pump_supervisor(target: int) -> None:
                     refreshes += 1
                     emit(f"[mon-sup] FPS-DEGRADED exit (rc={rc}) -> emulator refresh "
                          f"{refreshes}/{MAX_EMU_REFRESH}")
-                    if not refresh_emulator(emit):
+                    if not _refresh_emulator_safely(emit):
                         emit("[mon-sup] refresh FAILED (emulator never booted) — "
                              "relaunching anyway; a dead emulator yields zero-run "
                              "attempts and the existing bounded budgets stop the batch")
@@ -532,12 +618,14 @@ def test(path: str) -> None:
         log(f"would tap: {_CARD_CENTERS[i]} then {_CARD_CENTERS[j]}")
 
 
-def main(supervise_target: "int | None" = None) -> None:
+def main(supervise_target: "int | None" = None) -> int:
     matcher = TemplateMatcher(TEMPLATES)
     if not matcher.has("cardgame"):
         log("FATAL: no `cardgame` template loaded -- cannot detect the card game.")
         sys.exit(1)
     if supervise_target:
+        _STOP.clear()
+        _sup.update(target=supervise_target, done=0, finished=False, proc=None)
         log(f"monitor: SUPERVISING {supervise_target} runs + card/adb watch | serial={SERIAL}")
         threading.Thread(target=_pump_supervisor, args=(supervise_target,),
                          daemon=True).start()
@@ -551,7 +639,11 @@ def main(supervise_target: "int | None" = None) -> None:
             try:
                 if supervise_target and _sup["finished"]:
                     log("supervisor finished -- monitor exiting")
-                    return
+                    return 0 if _sup["done"] >= supervise_target else 1
+                if _REFRESH_PENDING.is_set():
+                    seen = 0
+                    time.sleep(POLL_S)
+                    continue
                 f = grab()
                 if f is None:
                     grab_fails += 1
@@ -573,7 +665,8 @@ def main(supervise_target: "int | None" = None) -> None:
                         seen = 0
                         hb = time.monotonic()
                 elif matcher.present(f, "league_results", 0.85):
-                    dismiss_modal(matcher, "league_results", (1280, 1210), "LEAGUE RESULTS")
+                    _dismiss_modal_safely(matcher, "league_results", (1280, 1210),
+                                          "LEAGUE RESULTS")
                     seen = 0
                     hb = time.monotonic()
                 else:
@@ -597,19 +690,31 @@ def main(supervise_target: "int | None" = None) -> None:
         # relaunching and don't leave an orphaned farm running unattended.
         if supervise_target:
             _STOP.set()
-            p = _sup.get("proc")
-            if p is not None:
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
-            _kill_stray_farm()
+            with _SUP_LAUNCH_LOCK:
+                p = _sup.get("proc")
+                if p is not None:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                _kill_stray_farm()
+
+
+def _main_with_device_lock(supervise_target=None) -> int:
+    owner = _acquire_device_lock()
+    if owner is None:
+        log(f"FATAL: another monitor already owns emulator {SERIAL}")
+        return 1
+    try:
+        return main(supervise_target=supervise_target)
+    finally:
+        owner.close()
 
 
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "test":
         test(sys.argv[2])
     elif len(sys.argv) >= 3 and sys.argv[1] == "supervise":
-        main(supervise_target=int(sys.argv[2]))
+        raise SystemExit(_main_with_device_lock(supervise_target=int(sys.argv[2])))
     else:
-        main()
+        raise SystemExit(_main_with_device_lock())

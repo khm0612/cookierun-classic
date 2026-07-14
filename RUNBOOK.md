@@ -1,6 +1,6 @@
 # CookieRun Bot — Runbook
 
-Everything needed to record, train, and run the auto-farmer in one place.
+Commands for recording, training, and running the auto-farmer in one place.
 
 The bot plays **CookieRun Classic** (Episode 1) on **LDPlayer**, farming Coins with
 **Double Coins** + boosts active on every run. Dodging is done by an imitation-learning
@@ -25,7 +25,10 @@ All commands below are run from the repo root: `C:\Users\singh\Desktop\cookierun
 
 ## 1. TL;DR — just farm
 
-A trained model already ships in `data/demo/model.pt`.
+The repository does not ship a trained model or calibrated templates. Both `data/` and
+`templates/` are machine-local and ignored by Git. Restore your own `templates/`,
+`data/demo/model.pt`, and `data/demo/model_meta.json`, or complete §2 to record and train a
+model before using the learned-agent commands below.
 
 **⭐ One command — everything at once** (model + logging + card-game solver + adb recovery +
 supervisor relaunch, streamed live to console *and* a timestamped `logs/run_*.log`):
@@ -218,3 +221,18 @@ data/
   ai_hits/           per-run hit diagnostics
 config.yaml          device + gesture + spending config (gitignored, machine-local)
 ```
+
+`templates/` and all of `data/` in this map are generated or supplied locally; they are not
+present in a clean checkout.
+
+## 8. Optional authenticated Android Wi-Fi bridge
+
+The Android bridge displays a random token beside its IP address and port. Copy it into the
+same PowerShell session before starting a `capture: network` client:
+
+```powershell
+$env:COOKIERUN_BRIDGE_TOKEN = "token-shown-on-phone"
+```
+
+Connections without the token are rejected. The protocol is authenticated but not encrypted,
+so use it only on a trusted local network and do not share the token.

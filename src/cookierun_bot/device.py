@@ -8,8 +8,6 @@ def select_adb_serial(requested: str, devices: list[str]) -> tuple[str, str]:
     requested = requested.strip()
     if requested and requested in devices:
         return requested, "ready"
-    if requested and len(devices) == 1:
-        return devices[0], "ready"
     if requested:
         return requested, "device missing"
     if devices:
@@ -104,6 +102,8 @@ class ScrcpyDevice:
         return buf
 
     def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("scrcpy decoder thread is still running")
         import struct
         import threading
         import adbutils
@@ -179,6 +179,8 @@ class ScrcpyDevice:
                         for frame in codec.decode(packet):
                             arr = frame.to_ndarray(format="bgr24")   # BGR, full device res
                             with self._lock:
+                                if not self._alive:
+                                    break
                                 self._latest = arr
                                 self._res = (arr.shape[1], arr.shape[0])
                                 self._frame_count += 1
@@ -210,7 +212,19 @@ class ScrcpyDevice:
                     sock.close()
             except Exception:
                 pass
+        thread = self._thread
+        if thread is not None:
+            import threading
+            if thread is not threading.current_thread():
+                thread.join(timeout=1.0)
+        with self._lock:
+            self._latest = None
+            self._res = (0, 0)
+        self._frame_event.clear()
+        self._vs = None
         self._cs = None
+        self._server = None
+        self._thread = thread if thread is not None and thread.is_alive() else None
 
     def _restart(self) -> None:
         """The decode thread exited unexpectedly (socket EOF / emulator hiccup) while we
@@ -494,44 +508,34 @@ class NetworkDevice:
     """Talks to the on-device CR Bridge app over TCP/Wi-Fi: capture via MediaProjection,
     input via AccessibilityService. No ADB, no developer options. Coordinates are in
     captured-frame (phone screen) pixels."""
-    def __init__(self, host: str, port: int = 8080, timeout: float = 5.0):
+    def __init__(self, host: str, port: int = 8080, timeout: float = 5.0,
+                 token: str | None = None):
         self._host = host
         self._port = port
         self._timeout = timeout
+        self._token = token
         self._sock = None
         self._guest_size: tuple[int, int] | None = None
-        # capture size (W,H) and display rotation, from INFO; drives the tap transform.
-        self._cap = (0, 0)
-        self._rot = 0
 
     def start(self) -> None:
+        import os
         import socket
+        # ponytail: the bridge token is session-only, so an environment variable is enough.
+        token = (self._token or os.environ.get("COOKIERUN_BRIDGE_TOKEN", "")).strip()
+        if not token:
+            raise RuntimeError(
+                "network bridge requires COOKIERUN_BRIDGE_TOKEN from the phone app")
+        if any(ch.isspace() for ch in token):
+            raise ValueError("network bridge token must not contain whitespace")
         s = socket.create_connection((self._host, self._port), timeout=self._timeout)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock = s
-        self._calibrate_transform()
-
-    def _calibrate_transform(self) -> None:
-        """AccessibilityService gestures use the display's NATURAL-orientation coordinate
-        space, but MediaProjection captures in the current rotation. Read capture size +
-        rotation from INFO and map captured (x,y) -> natural-orientation gesture coords."""
-        import re
-        info = self.info()
-        cap = re.search(r"capture=(\d+)x(\d+)", info)
-        rot = re.search(r"rot=(\d+)", info)
-        if cap:
-            self._cap = (int(cap.group(1)), int(cap.group(2)))  # (width, height)
-        if rot:
-            self._rot = int(rot.group(1))
-
-    def _to_gesture(self, x, y) -> tuple[int, int]:
-        cw, ch = self._cap
-        r = self._rot
-        if r == 1:      # ROTATION_90 (landscape): gx = ch - cy, gy = cx
-            return int(round(ch - y)), int(round(x))
-        if r == 3:      # ROTATION_270 (landscape, other way): gx = cy, gy = cw - cx
-            return int(round(y)), int(round(cw - x))
-        return int(round(x)), int(round(y))   # ROTATION_0 (portrait): identity
+        try:
+            if self._send_line(f"AUTH {token}\n") != "OK":
+                raise BridgeCommandError("bridge authentication failed")
+        except BaseException:
+            self.stop()
+            raise
 
     def stop(self) -> None:
         try:
@@ -595,12 +599,11 @@ class NetworkDevice:
         return self._guest_size or (0, 0)
 
     def tap(self, x: int, y: int):
-        gx, gy = self._to_gesture(x, y)
-        self._require_gesture_ok(self._send_line(f"TAP {gx} {gy}\n"))
+        self._require_gesture_ok(self._send_line(f"TAP {int(round(x))} {int(round(y))}\n"))
 
     def hold(self, x: int, y: int, duration_ms: int):
-        gx, gy = self._to_gesture(x, y)
-        self._require_gesture_ok(self._send_line(f"HOLD {gx} {gy} {int(duration_ms)}\n"))
+        self._require_gesture_ok(
+            self._send_line(f"HOLD {int(round(x))} {int(round(y))} {int(duration_ms)}\n"))
 
     def info(self) -> str:
         """Diagnostics: 'acc=<bool> capture=WxH real=WxH rot=N' from the bridge app."""
@@ -640,6 +643,7 @@ class LDPlayerDevice:
         self._cam = None                       # dxcam camera (GPU capture)
         self._use_dx = False                   # dxcam verified to see the window (not black)
         self._present_cache = None             # last presented frame (dxcam returns None if unchanged)
+        self._stopped = True
 
     def start(self) -> None:
         from . import win_input
@@ -651,6 +655,7 @@ class LDPlayerDevice:
         guest = self._adb.last_frame()         # pure guest frame via adb screencap
         if guest is None:
             raise RuntimeError("adb screencap returned no frame for calibration")
+        self._stopped = False
         self._input_res = (guest.shape[1], guest.shape[0])   # e.g. 1600x900 or 2560x1440
         rect = win_input.get_window_rect(self._hwnd)
         if rect[0] <= -30000 or (rect[2] - rect[0]) < 320 or (rect[3] - rect[1]) < 240:
@@ -773,8 +778,17 @@ class LDPlayerDevice:
         except Exception:
             pass
         self._cam = None
+        self._use_dx = False
+        self._present_cache = None
+        self._stopped = True
+        try:
+            self._adb.stop()
+        except Exception:
+            pass
 
     def last_frame(self):
+        if self._stopped:
+            return None
         if self._adb_only:
             return self._adb.last_frame()
         import cv2

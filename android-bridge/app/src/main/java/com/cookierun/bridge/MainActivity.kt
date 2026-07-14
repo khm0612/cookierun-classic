@@ -5,17 +5,22 @@ import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.provider.Settings
+import android.util.Base64
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.security.SecureRandom
 
 /** Minimal UI: grant screen capture, enable accessibility, show the phone's IP:port. */
 class MainActivity : Activity() {
 
     private lateinit var status: TextView
+    private val bridgeToken: String by lazy {
+        processToken ?: generateToken().also { processToken = it }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -25,8 +30,10 @@ class MainActivity : Activity() {
             setPadding(48, 96, 48, 48)
         }
         val ip = TextView(this).apply {
-            text = "Phone IP: ${localIp()}   Port: ${CaptureService.PORT}"
+            text = ("Phone IP: ${localIp()}   Port: ${CaptureService.PORT}\n" +
+                    "Bridge token: $bridgeToken")
             textSize = 18f
+            setTextIsSelectable(true)
         }
         val btnCap = Button(this).apply {
             text = "1) Start screen capture"
@@ -62,6 +69,7 @@ class MainActivity : Activity() {
             val svc = Intent(this, CaptureService::class.java)
                 .putExtra(CaptureService.EXTRA_CODE, resultCode)
                 .putExtra(CaptureService.EXTRA_DATA, data)
+                .putExtra(CaptureService.EXTRA_TOKEN, bridgeToken)
             startForegroundService(svc)
             status.text = "Capture ON. Bridge listening on ${localIp()}:${CaptureService.PORT}"
         } else if (requestCode == REQ_CAPTURE) {
@@ -84,7 +92,14 @@ class MainActivity : Activity() {
         return "unknown"
     }
 
+    private fun generateToken(): String {
+        val bytes = ByteArray(32)
+        SecureRandom().nextBytes(bytes)
+        return Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+    }
+
     companion object {
         const val REQ_CAPTURE = 1001
+        @Volatile private var processToken: String? = null
     }
 }

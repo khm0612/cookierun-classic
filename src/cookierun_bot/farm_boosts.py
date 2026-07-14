@@ -7,8 +7,8 @@ import numpy as np
 
 from .detect import read_int
 from .farm_common import (
-    _nav_read, _boost_read_fast, _sleep_interruptible, _stop_requested, _wait_for_change,
-    _tap_template, _find_stable, _tile_checked, _tile_checked_stable,
+    _boost_read_fast, _stop_requested, _wait_for_change, _find_stable, _tile_checked,
+    _tile_checked_stable,
     BoostResult, BoostTileStatus, BoostGateStatus,
 )
 
@@ -126,6 +126,10 @@ def ensure_run_boosts(dev, matcher, spending, log=print, should_stop=None) -> Bo
     Never taps a tile it can't see or one already checked (a tap would toggle it OFF).
     Returns whether all three required tiles are verified checked plus the estimated
     per-run coin cost of the priced tiles that end up checked."""
+    fixed_cost = sum(cost for _name, cost in _RUN_BOOST_TILES)
+    if int(spending.max_boost_cost_per_run) < fixed_cost:
+        log(f"[boost] fixed tile cost {fixed_cost} exceeds per-run cap; skipping")
+        return BoostResult(False, 0)
     cost = 0
     for name, tile_cost in _RUN_BOOST_TILES:
         # FAST PATH (the common case): the three checks PERSIST across runs, so each tile is almost
@@ -170,71 +174,14 @@ def ensure_run_boosts(dev, matcher, spending, log=print, should_stop=None) -> Bo
     return BoostResult(True, cost)
 
 
-_BUY_POLL_CEILING_S = 90.0   # generous: one auto-roll can take many rerolls on bad luck
-
-
 def buy_double_coins(dev, matcher, spending, log=print,
                      should_stop=None) -> BoostResult:
-    """On the pre-run boost screen, buy the Random Boost via Multi-Buy so the run's
-    'Double Coins' boost is active (red banner above Play!). USER-AUTHORIZED coin spend.
+    """Refuse Multi-Buy because one tap authorizes an unbounded number of in-game rerolls.
 
-    MECHANIC (verified live): the green 'Multi-Buy' button uses the game's own "keep
-    spending Coins until you get a selected Boost" auto-roll. ONE tap re-rolls the Random
-    Boost internally (1,200 first + 600 per reroll) and STOPS ITSELF the instant Double
-    Coins lands (the only checked boost) — spending a RANDOM total (~3k observed) over ~15s
-    with the dialog open. The Multi-Buy button stays visible during the roll, so we tap it
-    EXACTLY ONCE then only poll for the banner: a second tap would launch a whole NEW
-    auto-roll = double spend, which the spend guardrail forbids.
-
-    Templates: multibtn (pink 'Multi'), pickboosts ('Pick desired Boosts!' header),
-    dblcheck (Double Coins CHECKED), dblrow ('Double Coins' label), multibuy (green
-    'Multi-Buy'), dblbanner (red 'Double Coins' active banner).
-
-    Returns whether the banner is verified active, plus an ESTIMATED spend — the true cost
-    is random and the on-screen coin counter OCRs unreliably on this screen."""
-    budget = int(spending.max_boost_cost_per_run)
-    if not spending.allow_coin_boosts or budget < spending.double_coins_first_cost:
-        log("[boost] coin boosts off or budget below the first-roll cost; skipping")
-        return BoostResult(False, 0)
-    rolls = max(1, int(spending.max_double_coin_rolls))
-    est = min(budget, spending.double_coins_first_cost
-              + spending.double_coins_reroll_cost * (rolls - 1))
-
-    deadline = time.monotonic() + _BUY_POLL_CEILING_S
-    rolled = False                                     # latch: Multi-Buy tapped once, never again
-    while time.monotonic() < deadline and not _stop_requested(should_stop):
-        f = _boost_read_fast(dev)                      # ~3ms dxcam: banner/dialog/buttons score ~0.99
-        if f is None:                                  # on it; the single-tap latch guards double-spend
-            _sleep_interruptible(0.3, should_stop)
-            continue
-        if matcher.present(f, "dblbanner", 0.80):
-            return BoostResult(True, est if rolled else 0)   # Double Coins loaded for the run
-        if rolled:
-            _sleep_interruptible(0.5, should_stop)     # auto-roll in progress — just wait it out
-            continue
-        if matcher.present(f, "pickboosts", 0.80):     # 'Pick desired Boosts!' dialog is open
-            if not matcher.present(f, "dblcheck", 0.80):
-                pt = matcher.find(f, "dblrow", 0.75)   # unchecked -> tap the label to select it
-                if pt:
-                    dev.tap(*pt)
-                    _wait_for_change(dev, f, timeout_s=1.0, should_stop=should_stop)
-                    continue
-            pt = matcher.find(f, "multibuy", 0.80)
-            if pt is not None:
-                dev.tap(*pt)
-                rolled = True                          # single auto-roll straight to Double Coins
-                log(f"[boost] Multi-Buy tapped; auto-rolling to Double Coins (~{est} est spend)")
-                _wait_for_change(dev, f, timeout_s=2.0, should_stop=should_stop)
-            continue
-        if _tap_template(dev, matcher, "multibtn", 0.80):
-            _wait_for_change(dev, f, timeout_s=1.5, should_stop=should_stop)   # open the dialog
-            continue
-        if _tap_template(dev, matcher, "chesttile", 0.80):
-            # the right panel cycles; tapping the '?' chest tile in the left grid brings
-            # the Random Boost panel (with the Multi pill) back into view
-            _wait_for_change(dev, f, timeout_s=1.5, should_stop=should_stop)
-            continue
-        _sleep_interruptible(0.5, should_stop)
-    f = _nav_read(dev)
-    active = f is not None and matcher.present(f, "dblbanner", 0.80)
-    return BoostResult(active, est if rolled else 0)
+    A finite ``max_boost_cost_per_run`` cannot be enforced after that tap, and the screen's
+    coin OCR is not reliable enough to stop it. An already-active banner is handled by the
+    caller's read-only gate before this function is reached.
+    """
+    if spending.allow_coin_boosts:
+        log("[boost] Multi-Buy has no enforceable spend cap; skipping")
+    return BoostResult(False, 0)

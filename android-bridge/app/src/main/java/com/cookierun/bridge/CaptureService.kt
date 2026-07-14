@@ -28,8 +28,8 @@ class CaptureService : Service() {
     private var imageReader: ImageReader? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var bridge: BridgeServer? = null
-    private var vWidth = 0
-    private var vHeight = 0
+    @Volatile private var vWidth = 0
+    @Volatile private var vHeight = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -38,8 +38,11 @@ class CaptureService : Service() {
         val code = intent?.getIntExtra(EXTRA_CODE, Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
         @Suppress("DEPRECATION")
         val data = intent?.getParcelableExtra<Intent>(EXTRA_DATA)
-        if (code == Activity.RESULT_OK && data != null) {
-            startCapture(code, data)
+        val token = intent?.getStringExtra(EXTRA_TOKEN).orEmpty()
+        if (code == Activity.RESULT_OK && data != null && token.isNotBlank()) {
+            startCapture(code, data, token)
+        } else {
+            stopSelf(startId)
         }
         return START_NOT_STICKY
     }
@@ -57,7 +60,8 @@ class CaptureService : Service() {
         startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
     }
 
-    private fun startCapture(code: Int, data: Intent) {
+    private fun startCapture(code: Int, data: Intent, token: String) {
+        if (projection != null || bridge != null) return
         val mpm = getSystemService(MediaProjectionManager::class.java)
         val proj = mpm.getMediaProjection(code, data)
         projection = proj
@@ -84,7 +88,9 @@ class CaptureService : Service() {
 
         bridge = BridgeServer(
             PORT,
+            token,
             ::latestJpeg,
+            getBounds = { Pair(vWidth, vHeight) },
             onTap = { x, y, dur ->
                 TapAccessibilityService.instance?.tap(x, y, dur) ?: "no_acc"
             },
@@ -177,6 +183,7 @@ class CaptureService : Service() {
         projection = null
         imageReader = null
         virtualDisplay = null
+        bridge = null
     }
 
     override fun onDestroy() {
@@ -189,5 +196,6 @@ class CaptureService : Service() {
         const val PORT = 8080
         const val EXTRA_CODE = "code"
         const val EXTRA_DATA = "data"
+        const val EXTRA_TOKEN = "token"
     }
 }

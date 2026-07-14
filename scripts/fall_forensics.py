@@ -23,7 +23,7 @@ Usage:
 from __future__ import annotations
 import os, sys, json, glob
 import numpy as np
-from _runtime import DATA
+from _runtime import DATA, recording_is_complete
 
 BASE = str(DATA)
 CLASSES = ["none", "jump", "slide"]
@@ -56,7 +56,8 @@ def run_dirs_with_falls():
     for d in dirs:
         cp = os.path.join(d, "cache_pits.npy")
         if os.path.exists(cp) and os.path.exists(os.path.join(d, "frames.json")):
-            if len(np.load(cp)):
+            metadata = json.load(open(os.path.join(d, "frames.json")))
+            if recording_is_complete(metadata) and len(np.load(cp)):
                 out.append(d)
     return out
 

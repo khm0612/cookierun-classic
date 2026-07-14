@@ -1,7 +1,10 @@
-import pytest
+import threading
 from types import SimpleNamespace
 
+import pytest
+
 from cookierun_bot.agents.controller import (
+    ControllerApp,
     adb_ready_devices,
     controller_runtime_config,
     format_action_brief,
@@ -77,11 +80,11 @@ def test_adb_ready_devices_returns_empty_on_adb_error(monkeypatch):
     assert adb_ready_devices("adb") == []
 
 
-def test_select_adb_serial_auto_switches_only_single_ready_device():
+def test_select_adb_serial_only_auto_selects_when_no_device_was_requested():
     assert select_adb_serial("", ["emulator-5554"]) == ("emulator-5554", "ready")
     assert select_adb_serial("127.0.0.1:5555", ["emulator-5554"]) == (
-        "emulator-5554",
-        "ready",
+        "127.0.0.1:5555",
+        "device missing",
     )
     assert select_adb_serial("missing", ["a", "b"]) == ("missing", "device missing")
     assert select_adb_serial("", []) == ("", "no devices")
@@ -141,3 +144,37 @@ def test_controller_runtime_config_applies_ui_overrides():
 def test_controller_runtime_config_rejects_unknown_capture():
     with pytest.raises(ConfigError):
         controller_runtime_config(_cfg(), "", "bad", "")
+
+
+def test_window_close_signals_and_joins_farm_worker_before_destroying():
+    class FakeRoot:
+        destroyed = False
+
+        def after(self, _delay, callback):
+            callback()
+
+        def destroy(self):
+            self.destroyed = True
+
+    class FakeThread:
+        alive = True
+        joins = []
+
+        def join(self, timeout=None):
+            self.joins.append(timeout)
+            self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+    app = ControllerApp.__new__(ControllerApp)
+    app.root = FakeRoot()
+    app._stop_event = threading.Event()
+    app._thread = FakeThread()
+    app._closing = False
+
+    app._on_close()
+
+    assert app._stop_event.is_set()
+    assert app._thread.joins
+    assert app.root.destroyed

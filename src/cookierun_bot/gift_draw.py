@@ -270,4 +270,4 @@ def draw_gifts(dev, matcher, log=print, should_stop=None, max_steps: int = 80,
 
         return GiftDrawResult(draws=draws, depleted=False, opened=opened)
 
-    return GiftDrawResult(draws=draws, depleted=saw_gift_ui, opened=opened)
+    return GiftDrawResult(draws=draws, depleted=False, opened=opened)

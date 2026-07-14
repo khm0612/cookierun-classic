@@ -115,13 +115,12 @@ def test_slidehold_min_hold_keeps_slide_down_through_a_brief_prediction():
     assert not s.held and len(d.releases) == 1
 
 
-def test_slidehold_release_interrupts_a_min_hold_slide_so_a_jump_never_blocks():
-    """A JUMP calls release() to free the one finger; release() must lift IMMEDIATELY even mid
-    min-hold, so a 1.5s min-hold slide can never block a needed jump."""
+def test_slidehold_reports_when_min_hold_protects_against_jump():
     d, s = _PressDevice(), SlideHold(grace_s=0.4, min_hold_s=1.5)
-    s.update(d, _G, True, now=0.0)                     # DOWN, min-hold would run to 1.5s
-    s.release(d, _G)                                   # jump path frees the finger at t~0
-    assert not s.held and len(d.releases) == 1         # lifted immediately, not held to 1.5s
+    s.update(d, _G, True, now=0.0)
+
+    assert s.protecting(now=1.49) is True
+    assert s.protecting(now=1.50) is False
 
 
 def test_slidehold_min_hold_does_not_shorten_a_genuinely_long_slide():

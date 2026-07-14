@@ -106,7 +106,9 @@ def _read_bool(value, default: bool = False) -> bool:
             return True
         if v in {"0", "false", "no", "off"}:
             return False
-    return bool(value)
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ConfigError(f"invalid boolean: {value!r}")
 
 
 def load_config(path: str = "config.yaml") -> Config:

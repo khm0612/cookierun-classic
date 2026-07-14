@@ -1,8 +1,8 @@
 """Mine AUTOMATIC negative examples from bot self-runs for the "hit cam" training signal.
 
 Idea (user's): the human demo is the POSITIVE signal (imitate correct play); the bot's own
-runs are the NEGATIVE signal — specifically the moments it got HIT (HP bar drops) or fell in a
-PIT (run ends with no HP drop). At those pre-hit frames the bot was passive ("none") and paid
+runs are the NEGATIVE signal — specifically the moments it got HIT (HP bar drops) or produced a
+detector-confirmed PIT revive prompt. At those pre-hit frames the bot was passive ("none") and paid
 for it, so we teach the model to be LESS passive there. This script detects those events from
 the recorded frames and dumps the pre-hit K-stacks, built with the SAME crop + consecutive-frame
 geometry train2.py uses for positives (so the negatives are in-distribution).
@@ -13,8 +13,8 @@ unlikelihood loss that pushes p(none) DOWN on these frames.
 
 HP bar: read as the orange-saturated pixel fraction in a fixed fractional strip (works at any
 save resolution). A HIT = a >HP_DROP fall within ~1.1s (the slow continuous health decay never
-trips this; only a sudden knock does). A PIT = the run ended with HP still up (instant death,
-no drop) -> the final decision window is the negative.
+trips this; only a sudden knock does). PIT labels require recorder evidence; uncertain terminal
+frames are deliberately not guessed.
 """
 import os, sys, json, glob
 from _runtime import DATA
@@ -38,9 +38,45 @@ META_FROM = _farg("--meta-from", os.path.join(BASE, "demo", "model_meta.json"))
 OUT = _farg("--out", os.path.join(BASE, "ai_hits", "auto_negatives.npz"))
 HP_DROP = float(_farg("--hp-drop", "0.06"))     # min HP fall within the window to count a hit
 PRE_S = float(_farg("--pre", "0.30"))           # stack ends this far BEFORE impact (the decision)
+PIT_PROMPT_LAG_S = float(_farg("--pit-prompt-lag", "0.75"))
 HITWIN_S = 1.1                                   # window over which the drop is measured
 MIN_GAP_S = 0.6                                  # dedupe: >= this many seconds between hits
 HP_LO_T = float(_farg("--hp-lo", "0.06"))        # below this = bar basically empty (skip: refills/noise)
+
+
+def _pit_times(metadata):
+    """Return only detector-confirmed pit timestamps stored by the recorder."""
+    if metadata.get("complete") is False:
+        return []
+    duration = float(metadata.get("duration_s", 0.0) or 0.0)
+    frame_times = []
+    for frame in metadata.get("frames", []):
+        try:
+            frame_times.append(float(frame["t"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    latest_frame = min(duration, max(frame_times)) if frame_times else duration
+    result = []
+    for value in metadata.get("pit_times", []):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= value <= latest_frame:
+            result.append(value)
+    return result
+
+
+def _decision_time(event_time, kind):
+    """The revive prompt appears after the miss; move pit stacks back before the ledge."""
+    return event_time - PRE_S - (PIT_PROMPT_LAG_S if kind == "pit" else 0.0)
+
+
+def _default_run_names(base):
+    dirs = glob.glob(os.path.join(base, "demo_self_*")) + glob.glob(os.path.join(base, "botrun_*"))
+    return sorted(os.path.basename(d) for d in dirs
+                  if os.path.exists(os.path.join(d, "frames.json")))
+
 
 meta = json.load(open(META_FROM))
 K, H, W = int(meta["K"]), int(meta["H"]), int(meta["W"])
@@ -48,8 +84,7 @@ x0f, y0f, x1f, y1f = meta["crop"]
 print(f"meta: K{K} H{H} W{W} crop{meta['crop']} from {META_FROM}", flush=True)
 
 if not RUN_NAMES:
-    RUN_NAMES = [os.path.basename(d) for d in sorted(glob.glob(os.path.join(BASE, "demo_self_*")))
-                 if os.path.exists(os.path.join(d, "frames.json"))]
+    RUN_NAMES = _default_run_names(BASE)
 print(f"neg runs ({len(RUN_NAMES)}): {RUN_NAMES}", flush=True)
 
 
@@ -86,6 +121,9 @@ stacks, kinds, bacts, sruns, stimes = [], [], [], [], []
 for rn in RUN_NAMES:
     rdir = os.path.join(BASE, rn)
     fm = json.load(open(os.path.join(rdir, "frames.json")))
+    if fm.get("complete") is False:
+        print(f"  {rn}: incomplete recording, skipped", flush=True)
+        continue
     frames = sorted(fm["frames"], key=lambda f: f["idx"])
     idxs = np.array([f["idx"] for f in frames])
     ts = np.array([f["t"] for f in frames])
@@ -113,12 +151,12 @@ for rn in RUN_NAMES:
                 and hp_t[j] > 4.0 and hp_t[j] - last > MIN_GAP_S):
             last = hp_t[j]; hit_times.append(float(hp_t[j]))
 
-    # a PIT death: the run's final decision window (instant death, HP often still up -> no drop
-    # detected). Use the last frame's time as impact. Guard: only if run ended in-play (>8s).
-    pit_time = float(ts[-1]) if ts[-1] > 8.0 else None
+    # A long in-play ending is not evidence of a pit: HP deaths, time caps, and manual stops
+    # look the same here. Only use explicit detector events written by ai_farm.
+    pit_times = _pit_times(fm)
 
     def add_event(t_impact, kind):
-        t_dec = t_impact - PRE_S
+        t_dec = _decision_time(t_impact, kind)
         end = int(np.searchsorted(ts, t_dec))            # frame nearest the decision moment
         end = min(max(end, 0), len(frames) - 1)
         # K consecutive frames ending at `end`, clamped to run start (matches train2 idx_mat)
@@ -136,7 +174,7 @@ for rn in RUN_NAMES:
         return True
 
     nh = sum(add_event(t, "hit") for t in hit_times)
-    npit = int(add_event(pit_time, "pit")) if pit_time is not None else 0
+    npit = sum(add_event(t, "pit") for t in pit_times)
     print(f"  {rn}: {nh} hits + {npit} pit (from {len(hp_v)} hp samples)", flush=True)
 
 if not stacks:

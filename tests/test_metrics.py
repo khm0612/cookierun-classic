@@ -23,3 +23,12 @@ def test_empty_metrics_zero_rates():
     m = Metrics()
     assert m.coins_per_hour() == 0.0
     assert m.ingredients_per_hour() == 0.0
+
+
+def test_unread_run_time_still_counts_in_rate_denominator():
+    m = Metrics()
+    m.add(RunResult(coins=100, ingredients=2, duration_s=60.0))
+    m.add_unread(60.0)
+
+    assert m.coins_per_hour() == 3000.0
+    assert m.ingredients_per_hour() == 60.0

@@ -100,3 +100,25 @@ spending:
     cfg = load_config(str(tmp_path / "config.yaml"))
     assert cfg.spending.allow_coin_boosts is False
     assert cfg.spending.forbid_crystals is True
+
+
+def test_invalid_spending_boolean_is_rejected(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        """
+device: {capture: scrcpy}
+loop: {target_stage: "Episode 1", decision_hz: 15}
+regions:
+  play_area: [0, 200, 1080, 1200]
+  coin_counter: [800, 40, 200, 60]
+  mystery_box_counter: [500, 40, 120, 60]
+  results_coins: [400, 900, 300, 80]
+  results_ingredients: [400, 1000, 300, 80]
+gestures: {jump_button: [200, 1600], slide_button: [880, 1600], slide_hold_ms: 300}
+reward: {w_coin: 1.0, w_box: 50.0, w_survive: 0.01, death_penalty: 10.0}
+menu: {allowlist: [ok], denylist: [buy]}
+spending: {allow_coin_boosts: "flase"}
+        """
+    )
+
+    with pytest.raises(ConfigError, match="invalid boolean"):
+        load_config(str(tmp_path / "config.yaml"))

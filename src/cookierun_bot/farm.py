@@ -20,6 +20,7 @@ from .device import open_device, select_adb_serial
 from .gift_draw import GIFT_TEMPLATES, draw_gifts, gift_button_visible
 from .gestures import ACTION_JUMP, ACTION_NOOP, ACTION_SLIDE, SlideHold, apply_action
 from .metrics import Metrics, RunResult
+from .menu import MenuNavigator
 from .policies.rule_based import ActionDecision, StreamingRuleBasedAgent
 
 from .farm_common import (
@@ -59,6 +60,8 @@ def ensure_running(dev, matcher, cfg=None, tries: int = 240, log=print,
     cycle.setdefault("double_coin_cost", 0)
     gift_state = gift_state if gift_state is not None else {}
     gift_state.setdefault("depleted", False)
+    menu_nav = (MenuNavigator(dev, matcher, cfg)
+                if cfg is not None and hasattr(cfg, "menu_allowlist") else None)
     prev = None
     action_name = None
     action_seen = 0
@@ -73,6 +76,10 @@ def ensure_running(dev, matcher, cfg=None, tries: int = 240, log=print,
             return True
         f = _nav_read(dev)
         if f is None:
+            _sleep_interruptible(0.2, should_stop)
+            continue
+        if menu_nav is not None and menu_nav.is_spend_dialog(f):
+            log("[nav] configured spend/crystal dialog blocked")
             _sleep_interruptible(0.2, should_stop)
             continue
         snap = _snapshot(f)
@@ -121,6 +128,12 @@ def ensure_running(dev, matcher, cfg=None, tries: int = 240, log=print,
         if boostish:
             spending = getattr(cfg, "spending", None)
             if spending is not None and spending.allow_coin_boosts:
+                fixed_boost_cost = sum(cost for _name, cost in _RUN_BOOST_TILES)
+                if spending.max_boost_cost_per_run < fixed_boost_cost:
+                    log(f"[boost] fixed tile cost {fixed_boost_cost} exceeds per-run cap; "
+                        "not pressing Play")
+                    _sleep_interruptible(0.5, should_stop)
+                    continue
                 status = read_boost_gate_status(f, matcher)
                 log("[boost] " + format_boost_gate_status(status))
                 if getattr(cfg, "templates_dir", None):
@@ -132,8 +145,12 @@ def ensure_running(dev, matcher, cfg=None, tries: int = 240, log=print,
                 # risks a re-check flaking and a stray tap toggling a tile back off — and
                 # both tile checks and the Double Coins boost persist for this run.
                 if status.ready_to_play:
-                    cycle.setdefault("boost_cost", cycle.get("required_boost_cost", 0)
-                                     + cycle.get("double_coin_cost", 0))
+                    if menu_nav is not None and not menu_nav.is_allowed("play"):
+                        log("[nav] play is not in menu allowlist")
+                        _sleep_interruptible(0.2, should_stop)
+                        continue
+                    cycle["required_boost_cost"] = fixed_boost_cost
+                    cycle["boost_cost"] = fixed_boost_cost + cycle.get("double_coin_cost", 0)
                     _tap_template(dev, matcher, "play", 0.80)
                     # arm the Head Start watch NOW: the prompt fires the instant the
                     # run starts and its window is too short for post-detection watchers
@@ -147,11 +164,8 @@ def ensure_running(dev, matcher, cfg=None, tries: int = 240, log=print,
                     _sleep_interruptible(0.5, should_stop)
                     continue
                 cycle["required_boost_cost"] = required_boosts.spent
-                # buy_double_coins short-circuits to (True, 0) if the banner is already up.
-                # The failed-latch only holds while the banner is genuinely absent: a slow
-                # auto-roll can land AFTER our poll ceiling, and the banner also survives a
-                # game restart — in both cases fall through so the verified banner unwedges
-                # the cycle without any new Multi-Buy tap.
+                # The ready gate above handles an already-active banner. Once a bounded
+                # purchase attempt fails, do not retry it within this navigation cycle.
                 if cycle.get("double_coin_failed") and not matcher.present(f, "dblbanner", 0.80):
                     log("[boost] Double Coins was already attempted and not verified; not retrying")
                     _sleep_interruptible(0.5, should_stop)
@@ -166,6 +180,10 @@ def ensure_running(dev, matcher, cfg=None, tries: int = 240, log=print,
                     continue
                 cycle["double_coin_failed"] = False
                 cycle["boost_cost"] = cycle["required_boost_cost"] + cycle["double_coin_cost"]
+            if menu_nav is not None and not menu_nav.is_allowed("play"):
+                log("[nav] play is not in menu allowlist")
+                _sleep_interruptible(0.2, should_stop)
+                continue
             _tap_template(dev, matcher, "play", 0.80)  # start the run
             # arm the Head Start watch NOW (see ready_to_play branch)
             _watch_headstart(dev, matcher, log=log, should_stop=should_stop)
@@ -182,6 +200,8 @@ def ensure_running(dev, matcher, cfg=None, tries: int = 240, log=print,
                           ("close", 0.82),     # close event-popup X
                           ("close2", 0.82),    # close Friend's Info / Medal Shop X (leaderboard wedge)
                           ("play", 0.80)):     # menu Play! (boost Play goes via the branch)
+            if menu_nav is not None and not menu_nav.is_allowed(name):
+                continue
             # 'close'/'close2' on the boost screen would X the Buy-Upgrades panel and HIDE
             # the tile grid the boost gate must verify (observed live) — never tap there.
             if name in ("close", "close2") and boostish:
@@ -404,12 +424,17 @@ def _run_loop(dev, cfg, agent, matcher, max_s, min_s, should_stop, log,
         # backlog: per-tick `input swipe ... 500` re-fires stacked seconds of queued
         # gestures in the adb shell (LDPlayer has no scrcpy-style one-finger throttle).
         slide_ctl.update(dev, cfg.gestures, decision.action == ACTION_SLIDE)
+        effective_action = ACTION_SLIDE if slide_ctl.held else ACTION_NOOP
         if decision.action == ACTION_JUMP:
-            if slide_ctl.held:
-                slide_ctl.release(dev, cfg.gestures)   # one finger: end slide, then jump
-            apply_action(dev, decision.action, cfg.gestures)
+            if not slide_ctl.protecting():
+                if slide_ctl.held:
+                    slide_ctl.release(dev, cfg.gestures)   # one finger: end slide, then jump
+                apply_action(dev, decision.action, cfg.gestures)
+                effective_action = ACTION_JUMP
         if on_step is not None:               # observer hook (diagnostics): never mutates
-            on_step(time.monotonic() - t0, f, decision)
+            observed = (decision if decision.action == effective_action
+                        else replace(decision, action=effective_action))
+            on_step(time.monotonic() - t0, f, observed)
         snap = _snapshot(f)
         if prev is not None and snap is not None and _diff(snap, prev) < 2.5:
             still += 1
@@ -633,6 +658,7 @@ def farm(cfg_path: str = "config.yaml", max_runs: int | None = None,
                 # screen hid it, or the coin digits misread to 0). A completed run never truly
                 # banks 0 coins, so book it as UNREAD — never as a real 0-coin/negative-net run
                 # that would drag coins/hr and net/hr below the truth (matches scripts/ai_farm).
+                metrics.add_unread(cycle_s)
                 log(f"[run {run}] UNREAD — Result screen missed; banked but uncounted "
                     f"survived={dur:.0f}s cycle={cycle_s:.0f}s | {metrics.summary()}")
                 continue

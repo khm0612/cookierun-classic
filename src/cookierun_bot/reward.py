@@ -18,13 +18,15 @@ class RewardTracker:
     def update(self, coins, boxes: int, dead: bool) -> float:
         self._steps += 1
         coin_delta = 0
-        if coins is not None:
-            coin_delta = max(0, coins - self._prev_coins)
+        if coins is not None and coins >= self._prev_coins:
+            coin_delta = coins - self._prev_coins
             self._prev_coins = coins
             self._total_coins = coins
-        box_delta = max(0, boxes - self._prev_boxes)
-        self._prev_boxes = boxes
-        self._total_boxes = max(self._total_boxes, boxes)
+        box_delta = 0
+        if boxes >= self._prev_boxes:
+            box_delta = boxes - self._prev_boxes
+            self._prev_boxes = boxes
+            self._total_boxes = boxes
 
         reward = self._w.w_coin * coin_delta + self._w.w_box * box_delta
         if dead:

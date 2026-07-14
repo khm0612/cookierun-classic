@@ -3,7 +3,7 @@ per-hit diagnostics for improving the model. For every HP drop it dumps the pre-
 what the model SAW (frames at ~-0.7s/-0.3s/impact) and what it THOUGHT (class/prob/action
 trace), so failures can be categorized (blind / fired-but-hit / cooldown-blocked) instead
 of guessed at. Also logs per-run coin results. Runs until max runs or Ctrl+C."""
-import sys, os, time, json
+import sys, os, time, json, queue, threading
 from _runtime import CONFIG, DATA, ROOT
 import cv2, numpy as np
 from collections import deque
@@ -25,6 +25,95 @@ ACT = {ACTION_NOOP: "none", ACTION_JUMP: "jump", ACTION_SLIDE: "slide"}
 # ONLY for human labeling — the model always trains/infers on a 96x224 grayscale crop, so the
 # clip resolution has ZERO effect on model performance. (1920x1080 works too but ~1GB ring.)
 CLIP_WH = (960, 540)
+_DIAG_SESSION = f"{int(time.time())}{os.getpid() % 100000:05d}"
+
+
+def _diag_stem(run_no, session_id=None):
+    """Keep the historical r*_h* shape while preventing relaunch overwrites."""
+    return f"r{session_id or _DIAG_SESSION}{run_no:03d}"
+
+
+def _parse_hybrid_confs(raw, default):
+    import math
+    if not raw:
+        return default, default
+    try:
+        values = tuple(float(value.strip()) for value in raw.split(","))
+    except ValueError as exc:
+        raise SystemExit("AIFARM_HYBRID_CONFS must contain exactly two numbers") from exc
+    if len(values) != 2 or not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in values):
+        raise SystemExit("AIFARM_HYBRID_CONFS must contain exactly two numbers between 0 and 1")
+    return values
+
+
+class _RecordingWriter:
+    """Bounded JPEG writer whose metadata contains only completed writes."""
+
+    def __init__(self, run_dir, maxsize=1024):
+        self.run_dir = os.fspath(run_dir)
+        os.makedirs(os.path.join(self.run_dir, "frames"), exist_ok=True)
+        self.q = queue.Queue(maxsize=maxsize)
+        self.frames = []
+        self._frames_lock = threading.Lock()
+        self._accept_results = True
+        self._closed = False
+        self.error = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while True:
+            item = self.q.get()
+            try:
+                if item is None:
+                    return
+                idx, timestamp, payload = item
+                if self.error is not None:
+                    continue
+                try:
+                    path = os.path.join(self.run_dir, "frames", f"{idx:06d}.jpg")
+                    with open(path, "wb") as fh:
+                        if fh.write(payload) != len(payload):
+                            raise OSError(f"short write: {path}")
+                    with self._frames_lock:
+                        if self._accept_results:
+                            self.frames.append({"idx": idx, "t": timestamp})
+                except Exception as exc:
+                    self.error = exc
+            finally:
+                self.q.task_done()
+
+    def submit(self, idx, timestamp, payload):
+        if self._closed or self.error is not None or not self.thread.is_alive():
+            return False
+        try:
+            self.q.put_nowait((idx, timestamp, payload))
+            return True
+        except queue.Full:
+            return False
+
+    def close(self, timeout=10.0):
+        if self._closed:
+            return not self.thread.is_alive()
+        self._closed = True
+        deadline = time.monotonic() + timeout
+        while self.thread.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                self.q.put(None, timeout=min(0.1, remaining))
+                break
+            except queue.Full:
+                continue
+        self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        closed = not self.thread.is_alive()
+        with self._frames_lock:
+            self._accept_results = False
+            self.frames.sort(key=lambda frame: frame["idx"])
+        if not closed and self.error is None:
+            self.error = TimeoutError("recording writer did not stop before timeout")
+        return closed
 
 def hp_frac(f):
     strip = f[125:158, 240:820]
@@ -133,8 +222,7 @@ if _HYBRID:
     from cookierun_bot.policies.hybrid_phase import HybridPhaseAgent
     _bn, _xn = [s.strip() for s in _HYBRID.split(",")]
     _hc = os.environ.get("AIFARM_HYBRID_CONFS", "")
-    _bc, _xc = ([float(x) for x in _hc.split(",")] if _hc
-                else [min(conf, _JUMP_CAP)] * 2)
+    _bc, _xc = _parse_hybrid_confs(_hc, min(conf, _JUMP_CAP))
     agent = HybridPhaseAgent(_mk_agent(_bn, _bc), _mk_agent(_xn, _xc),
                              templates_dir=str(ROOT / "templates"))
     print(f"HYBRID agent: base={_bn}@{_bc} | bonus={_xn}@{_xc}", flush=True)
@@ -180,37 +268,8 @@ for run_no in range(1, MAX_RUNS + 1):
         print("!! could not reach a run — stopping", flush=True)
         break
     print(f">> RUN LIVE (boost spend: {cycle})", flush=True)
-    # Head Start via SHARP adb frames (user directive: press it EVERY round). The in-run
-    # dxcam path proved flaky at run start (stale frames = prompt never seen); sharp
-    # screencaps score the prompt 0.90. play_until_death's own check stays as backstop.
-    # Head Start watch on the FAST capture path (user directive: press it EVERY round).
-    # The prompt lives only ~2s and can appear the instant the HUD shows — a sharp-frame
-    # poll (~1s per look, starts after setup prints) proved structurally too slow
-    # ("no centre match at all" while the user watched the prompt come and go). At 60fps
-    # every prompt frame is sampled; the strict CENTRE position gate makes the low
-    # threshold safe (all known false matches sit far outside the centre box).
-    t_hs = time.time()
-    activated = False
-    hs_prev = None
-    wait_frame = getattr(dev, "wait_frame", None)
-    while time.time() - t_hs < 8:
-        fhs = wait_frame(0.1) if wait_frame else dev.last_frame()
-        if fhs is None:
-            continue
-        p = matcher.find(fhs, "headstart", 0.55)
-        # stable-point tap: taps at the historical rest point failed — the button's live
-        # settle position drifts; tap where two consecutive matches agree (<20px)
-        if p and abs(p[0] - 1220) < 400 and abs(p[1] - 690) < 260:
-            if hs_prev and abs(p[0] - hs_prev[0]) < 20 and abs(p[1] - hs_prev[1]) < 20:
-                print(f">> Head Start settled at {p} — tapping it", flush=True)
-                dev.tap(*p)
-                time.sleep(0.35)
-                dev.tap(*p)
-                activated = True
-                break
-            hs_prev = p
-    if not activated:
-        print(">> Head Start: prompt not seen within 8s of run start", flush=True)
+    # ensure_running owns the primary Head Start watcher; play_until_death keeps its guarded
+    # fallback. A third tap loop here raced stale frames and could double-tap the prompt.
     agent.reset()
 
     # JPEG-compressed ring (~40KB/frame): 600 entries ~= 10s at 60fps for ~25MB, so the
@@ -224,30 +283,16 @@ for run_no in range(1, MAX_RUNS + 1):
     # next IQL iteration (falls were unmeasurable before; 25 mined examples were too few).
     vrec = None                   # NOT `rec` — on_step's hit logger already binds that name
     if os.environ.get("AIFARM_RECORD") == "1":
-        import queue as _q
-        import threading as _th
         _rdir = os.path.join(os.path.dirname(REC), f"botrun_{time.strftime('%m%d_%H%M%S')}")
-        os.makedirs(os.path.join(_rdir, "frames"), exist_ok=True)
-        _wq = _q.Queue(maxsize=1024)
-
-        def _writer():
-            while True:
-                item = _wq.get()
-                if item is None:
-                    return
-                _i, _b = item
-                with open(os.path.join(_rdir, "frames", f"{_i:06d}.jpg"), "wb") as _fh:
-                    _fh.write(_b)
-
-        _wt = _th.Thread(target=_writer, daemon=True)
-        _wt.start()
-        vrec = {"dir": _rdir, "q": _wq, "thread": _wt, "frames": [], "keys": [], "idx": 0}
+        vrec = {"dir": _rdir, "writer": _RecordingWriter(_rdir), "keys": [], "idx": 0,
+                "cur": ACTION_NOOP}
         print(f">> RECORDING run to {_rdir}", flush=True)
     hp_hist = []; hits = []; steps = [0]; last_hit = [0.0]
     last_bt = [-9.0]              # bonustime latch: last time the banner was seen
     bt_skipped = [0]
     pits = [0]                    # PIT FALLS this run (revive-tanked falls included — the
     last_pit = [-9.0]             # setup absorbs 3, so these never show in hp/terminals)
+    pit_times = []
     # REBOUND-CONFIRM: a real hit leaves hp PERSISTENTLY lower; an overlay sweeping the
     # HP strip (bonus washes, zone-title cards — background-dependent, so the banner
     # template alone can't catch them all: the bright-jungle zone dropped its score
@@ -276,21 +321,20 @@ for run_no in range(1, MAX_RUNS + 1):
             _bts = buf.tobytes()
             ring.append((now, _bts, cls, prob, ACT.get(decision.action, "?")))
             if vrec is not None:
-                try:
-                    vrec["q"].put_nowait((vrec["idx"], _bts))
-                    vrec["frames"].append({"idx": vrec["idx"], "t": now})
-                except Exception:
-                    pass                       # full queue: drop frame, keep idx monotonic
-                vrec["idx"] += 1
-                if decision.action != ACTION_NOOP:
-                    vrec["keys"].append({
-                        "t": now, "action": ACT.get(decision.action, "none"),
-                        "dur": 0.5 if decision.action == ACTION_SLIDE else 0.1})
+                if vrec["writer"].submit(vrec["idx"], now, _bts):
+                    vrec["idx"] += 1
+        if vrec is not None and decision.action != vrec["cur"]:
+            if vrec["cur"] in (ACTION_JUMP, ACTION_SLIDE) and vrec["keys"]:
+                vrec["keys"][-1]["dur"] = round(max(0.0, now - vrec["keys"][-1]["t"]), 4)
+            if decision.action in (ACTION_JUMP, ACTION_SLIDE):
+                vrec["keys"].append({"t": now, "action": ACT[decision.action], "dur": 0.0})
+            vrec["cur"] = decision.action
         if bonustime(f):
             last_bt[0] = now
         if now - last_pit[0] > 4.0 and pitfall(f):     # prompt shows ~1-2s; 4s refractory
             pits[0] += 1
             last_pit[0] = now
+            pit_times.append(now)
             print(f"PIT FALL #{pits[0]} @ {now:.0f}s", flush=True)
         hp = hp_frac(f)
         hp_hist.append((now, hp))
@@ -310,7 +354,7 @@ for run_no in range(1, MAX_RUNS + 1):
                     # dump what the model saw at decision time (~0.7s/0.3s before) + impact
                     for tag, dt in (("pre07", 0.7), ("pre03", 0.3), ("impact", 0.0)):
                         cand = min(ring, key=lambda r: abs((p_t - dt) - r[0]))
-                        cv2.imwrite(os.path.join(OUT, f"r{run_no:02d}_h{k:03d}_{tag}.jpg"),
+                        cv2.imwrite(os.path.join(OUT, f"{_diag_stem(run_no)}_h{k:03d}_{tag}.jpg"),
                                     _ring_img(cand), [cv2.IMWRITE_JPEG_QUALITY, 85])
                     # k-frames: a true K-stack at TRAINING fps spacing ending at -0.3s so
                     # correction labels (scripts/correct.py) train with real motion context
@@ -318,11 +362,12 @@ for run_no in range(1, MAX_RUNS + 1):
                         for ki in range(K_STACK):
                             dt = 0.3 + (K_STACK - 1 - ki) / TRAIN_FPS
                             cand = min(ring, key=lambda r: abs((p_t - dt) - r[0]))
-                            cv2.imwrite(os.path.join(OUT, f"r{run_no:02d}_h{k:03d}_k{ki}.jpg"),
+                            cv2.imwrite(os.path.join(OUT, f"{_diag_stem(run_no)}_h{k:03d}_k{ki}.jpg"),
                                         _ring_img(cand), [cv2.IMWRITE_JPEG_QUALITY, 85])
                     except Exception:
                         pass
-                rec = {"run": run_no, "hit": k, "t": round(p_t, 1),
+                rec = {"run": int(_diag_stem(run_no)[1:]), "batch_run": run_no,
+                       "hit": k, "t": round(p_t, 1),
                        "hp": [round(p_rmax, 2), round(p_hp, 2)], "trace": trace}
                 hits.append(rec)
                 diag.write(json.dumps(rec) + "\n"); diag.flush()
@@ -338,8 +383,35 @@ for run_no in range(1, MAX_RUNS + 1):
                 return
             pending[0] = {"t": now, "rmax": rmax, "hp": hp}
 
-    dur = farm.play_until_death(dev, cfg, agent, matcher, max_s=1800, min_s=8.0,
-                                log=print, on_step=on_step)
+    dur = 0.0
+    recording_failed = False
+    play_completed = False
+    try:
+        dur = farm.play_until_death(dev, cfg, agent, matcher, max_s=1800, min_s=8.0,
+                                    log=print, on_step=on_step)
+        play_completed = True
+    finally:
+        if vrec is not None:
+            recorded_dur = max(dur, ring[-1][0] if ring else 0.0)
+            if vrec["cur"] in (ACTION_JUMP, ACTION_SLIDE) and vrec["keys"]:
+                vrec["keys"][-1]["dur"] = round(
+                    max(0.0, recorded_dur - vrec["keys"][-1]["t"]), 4)
+            closed = vrec["writer"].close(timeout=10)
+            written_frames = list(vrec["writer"].frames)
+            complete = (play_completed and closed and vrec["writer"].error is None
+                        and bool(written_frames))
+            with open(os.path.join(vrec["dir"], "frames.json"), "w") as fh:
+                json.dump({"frames": written_frames, "save_w": 640, "duration_s": recorded_dur,
+                           "actual_fps": round(len(written_frames) / max(recorded_dur, 0.1), 1),
+                           "pit_times": pit_times, "complete": complete}, fh)
+            with open(os.path.join(vrec["dir"], "keys.json"), "w") as fh:
+                json.dump(vrec["keys"], fh)
+            if not complete:
+                print(f"!! recording incomplete: {vrec['writer'].error or 'run/writer incomplete'}",
+                      flush=True)
+            print(f">> RECORDED {len(written_frames)} frames + {len(vrec['keys'])} actions "
+                  f"-> {os.path.basename(vrec['dir'])}", flush=True)
+            recording_failed = play_completed and not complete
     # DEATH CLIP: pit falls (the classic killer) end the run WITHOUT an HP drop, so the hit
     # logger never sees them — this dump does. h999 is the death sentinel: correct.py's
     # rNN_hMMM globbing queues it for labeling like any hit. The post-death scene sits
@@ -350,17 +422,17 @@ for run_no in range(1, MAX_RUNS + 1):
             t_end = ring[-1][0]
             for tag, dt in (("pre07", 0.7), ("pre03", 0.3), ("impact", 0.0)):
                 cand = min(ring, key=lambda r: abs((t_end - dt) - r[0]))
-                cv2.imwrite(os.path.join(OUT, f"r{run_no:02d}_h999_{tag}.jpg"),
+                cv2.imwrite(os.path.join(OUT, f"{_diag_stem(run_no)}_h999_{tag}.jpg"),
                             _ring_img(cand), [cv2.IMWRITE_JPEG_QUALITY, 85])
             for ki in range(K_STACK):
                 dt = 0.3 + (K_STACK - 1 - ki) / TRAIN_FPS
                 cand = min(ring, key=lambda r: abs((t_end - dt) - r[0]))
-                cv2.imwrite(os.path.join(OUT, f"r{run_no:02d}_h999_k{ki}.jpg"),
+                cv2.imwrite(os.path.join(OUT, f"{_diag_stem(run_no)}_h999_k{ki}.jpg"),
                             _ring_img(cand), [cv2.IMWRITE_JPEG_QUALITY, 85])
             for di, dt in enumerate((9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.5, 3.0, 2.5, 2.0,
                                      1.6, 1.2, 0.9, 0.6, 0.3, 0.0)):
                 cand = min(ring, key=lambda r: abs((t_end - dt) - r[0]))
-                cv2.imwrite(os.path.join(OUT, f"r{run_no:02d}_death_d{di:02d}.jpg"),
+                cv2.imwrite(os.path.join(OUT, f"{_diag_stem(run_no)}_death_d{di:02d}.jpg"),
                             _ring_img(cand), [cv2.IMWRITE_JPEG_QUALITY, 85])
     except Exception:
         pass
@@ -373,15 +445,6 @@ for run_no in range(1, MAX_RUNS + 1):
         print("!! BLIND RUN detected (0 decisions) — exiting for a clean restart", flush=True)
         dev.stop()
         sys.exit(2)
-    if vrec is not None:                       # finalize the training recording
-        vrec["q"].put(None)
-        vrec["thread"].join(timeout=10)
-        json.dump({"frames": vrec["frames"], "save_w": 640, "duration_s": dur,
-                   "actual_fps": round(len(vrec["frames"]) / max(dur, 0.1), 1)},
-                  open(os.path.join(vrec["dir"], "frames.json"), "w"))
-        json.dump(vrec["keys"], open(os.path.join(vrec["dir"], "keys.json"), "w"))
-        print(f">> RECORDED {len(vrec['frames'])} frames + {len(vrec['keys'])} actions "
-              f"-> {os.path.basename(vrec['dir'])}", flush=True)
     _contact = (len(hits) + rebounds[0]) / max(dur / 60, 0.01)   # every HP dip incl. the
     print(f">> RUN {run_no} OVER @ {dur:.0f}s | {len(hits)} hits ({len(hits)/max(dur/60,0.01):.1f}/min, "
           f"{bt_skipped[0]} bonus-artifact skipped, {rebounds[0]} rebound-discarded) "
@@ -394,7 +457,7 @@ for run_no in range(1, MAX_RUNS + 1):
     try:
         rf = farm._nav_read(dev)
         if rf is not None:
-            cv2.imwrite(os.path.join(OUT, f"result_r{run_no:02d}.jpg"),
+            cv2.imwrite(os.path.join(OUT, f"result_{_diag_stem(run_no)}.jpg"),
                         cv2.resize(rf, (1280, 720)), [cv2.IMWRITE_JPEG_QUALITY, 85])
     except Exception:
         pass
@@ -413,6 +476,12 @@ for run_no in range(1, MAX_RUNS + 1):
               f"screen pre-empted it); coins were banked but can't be counted. | session "
               f"total: {totals['coins']} coins / {totals['runs']} runs ({unread} unread)",
               flush=True)
+
+    if recording_failed:
+        print("!! stopping after the completed run because its recorder failed", flush=True)
+        diag.close()
+        dev.stop()
+        sys.exit(2)  # supervisor has counted RESULT and may restart without leaking the writer
 
     # EMULATOR-REFRESH check — run boundary ONLY (the >> RESULT: line above is already
     # out, so the supervisor has counted this run; nothing is ever cut off mid-run).

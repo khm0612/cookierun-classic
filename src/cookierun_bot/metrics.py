@@ -17,12 +17,16 @@ class RunResult:
 class Metrics:
     def __init__(self):
         self._runs: list[RunResult] = []
+        self._unread_seconds = 0.0
 
     def add(self, r: RunResult) -> None:
         self._runs.append(r)
 
+    def add_unread(self, duration_s: float) -> None:
+        self._unread_seconds += duration_s
+
     def _total_seconds(self) -> float:
-        return sum(r.duration_s for r in self._runs)
+        return self._unread_seconds + sum(r.duration_s for r in self._runs)
 
     def runs(self) -> int:
         return len(self._runs)

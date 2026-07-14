@@ -163,6 +163,7 @@ class ControllerApp:
         self._events: queue.Queue[tuple] = queue.Queue()
         self._stop_event: threading.Event | None = None
         self._thread: threading.Thread | None = None
+        self._closing = False
 
         self.config_path = tk.StringVar(value="config.yaml")
         self.adb_path = tk.StringVar(value="")
@@ -185,6 +186,7 @@ class ControllerApp:
         self.action_line = tk.StringVar(value=format_action_line(""))
 
         self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.load_defaults()
         self.root.after(100, self._poll_events)
 
@@ -536,6 +538,22 @@ class ControllerApp:
         self.status.set("stopping")
         self._refresh_summary("stopping")
         self._show_stop_button(enabled=False)
+
+    def _on_close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        if self._stop_event is not None:
+            self._stop_event.set()
+        self._join_then_close()
+
+    def _join_then_close(self) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout=0.1)
+            if self._thread.is_alive():
+                self.root.after(100, self._join_then_close)
+                return
+        self.root.destroy()
 
     def _poll_events(self) -> None:
         while True:

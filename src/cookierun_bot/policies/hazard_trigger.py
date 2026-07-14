@@ -64,8 +64,13 @@ class HazardTrigger:
         # preprocesses + infers as fast as the GPU allows and publishes self._p_pit.
         import threading
         self._async = os.environ.get("AIFARM_HAZARD_ASYNC", "1") == "1"
-        self._latest = None        # newest raw frame (written by decide, read by worker)
+        self._state_lock = threading.Lock()
+        self._latest = None        # (raw frame, frame sequence, reset generation)
+        self._frame_seq = 0
         self._p_pit = 0.0          # newest P(pit) (written by worker, read by decide)
+        self._p_seq = 0            # frame sequence that produced _p_pit
+        self._last_p_seq = 0       # last distinct inference consumed by decide()
+        self._generation = 0       # rejects a pre-reset inference that finishes late
         self._run_worker = self._async
         if self._async:
             self._wthread = threading.Thread(target=self._worker, daemon=True)
@@ -77,25 +82,44 @@ class HazardTrigger:
         """Background inference: preprocess the latest frame into the ring, run the head, publish
         P(pit). All hazard cost lives here, OFF the decision loop, so fps is untouched."""
         torch = self._torch
-        last_proc = None
+        last_seq = 0
         while self._run_worker:
-            fr = self._latest
-            if fr is None or fr is last_proc:
+            with self._state_lock:
+                item = self._latest
+            if item is None or item[1] == last_seq:
                 time.sleep(0.008)            # no new frame yet — don't stack duplicates
                 continue
-            last_proc = fr
+            fr, frame_seq, generation = item
+            last_seq = frame_seq
             try:
-                self._buf.append(self._preprocess(fr))
-                buf = list(self._buf)
+                processed = self._preprocess(fr)
+                with self._state_lock:
+                    if generation != self._generation:
+                        continue
+                    self._buf.append(processed)
+                    buf = list(self._buf)
                 if not buf:
                     continue
                 while len(buf) < self.K:
                     buf.insert(0, buf[0])
                 x = torch.from_numpy(np.stack(buf, 0)[None]).to(self._device).float().div_(255.0)
                 with torch.no_grad():
-                    self._p_pit = float(torch.sigmoid(self._net(x)).item())
+                    probability = float(torch.sigmoid(self._net(x)).item())
+                with self._state_lock:
+                    if generation == self._generation:
+                        self._p_pit = probability
+                        self._p_seq = frame_seq
             except Exception:
                 time.sleep(0.01)
+
+    def _publish_frame(self, frame) -> None:
+        """Publish at the configured detector cadence; each result gets one confirmation vote."""
+        self._fcount += 1
+        if self._fcount % self._check_every != 0:
+            return
+        with self._state_lock:
+            self._frame_seq += 1
+            self._latest = (frame, self._frame_seq, self._generation)
 
     # ---- interface parity with LearnedAgent / HybridPhaseAgent ----
     @property
@@ -108,9 +132,13 @@ class HazardTrigger:
 
     def reset(self) -> None:
         self.inner.reset()
-        self._buf.clear()
-        self._latest = None        # don't let the worker infer on a stale prev-run frame
-        self._p_pit = 0.0
+        with self._state_lock:
+            self._generation += 1
+            self._buf.clear()
+            self._latest = None    # don't let the worker infer on a stale prev-run frame
+            self._p_pit = 0.0
+            self._p_seq = 0
+            self._last_p_seq = 0
         self._cd_until = 0.0
         self._ep_hits = 0
         self._below = 0
@@ -121,7 +149,7 @@ class HazardTrigger:
     def observe(self, frame) -> None:
         self.inner.observe(frame)
         if self._async:
-            self._latest = frame
+            self._publish_frame(frame)
         else:
             self._push(frame)
 
@@ -150,7 +178,7 @@ class HazardTrigger:
     def decide(self, frame):
         d = self.inner.decide(frame)             # keeps the inner policy + its buffers warm
         if self._async:
-            self._latest = frame                 # publish to the worker (cheap ref store)
+            self._publish_frame(frame)
         else:
             self._push(frame)
         # bonustime belongs to the film dodger — the hybrid tags those frames "bonus/..."
@@ -160,7 +188,11 @@ class HazardTrigger:
                 self._ep_hits = 0
             return d
         if self._async:
-            p = self._p_pit                      # read the worker's cached probability (a float)
+            with self._state_lock:
+                p, p_seq = self._p_pit, self._p_seq
+            if p_seq == self._last_p_seq:
+                return d                         # cached result: not another confirmation read
+            self._last_p_seq = p_seq
         else:
             # SYNC fallback: throttle the head's forward pass every Nth frame (fps protection)
             self._fcount += 1

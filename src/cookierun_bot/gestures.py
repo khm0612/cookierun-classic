@@ -82,6 +82,12 @@ class SlideHold:
             device.release(self._pt[0] + random.randint(-4, 4),
                            self._pt[1] + random.randint(-4, 4))
 
+    def protecting(self, now: float | None = None) -> bool:
+        """Whether the configured minimum hold still forbids a jump-time release."""
+        if now is None:
+            now = time.monotonic()
+        return self.held and now < self._start + self._min_hold
+
     def force_release(self, device, g) -> None:
         """Unconditionally lift the finger at a run boundary. If a normal release()'s UP was
         silently rejected by adb (held cleared but the pointer physically stuck DOWN), the

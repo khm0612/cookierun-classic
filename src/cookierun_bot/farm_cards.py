@@ -1,5 +1,8 @@
-"""Post-run "Find the X card!" bonus: card-pair detection + the stand-down policy
-(the bot NEVER taps cards; it alerts and waits for the user/Claude to solve)."""
+"""Post-run card detection for the farm-side stand-down path.
+
+Only ``scripts/monitor.py`` owns card taps. The farm process keeps navigation paused until
+that monitor (or a user) clears the board.
+"""
 from __future__ import annotations
 import os
 import time
@@ -59,14 +62,8 @@ def _card_pair(frame):
     return int(order[0]), int(order[1]), margin
 
 
-def _cardgame(dev, matcher, log=print, should_stop=None,
-              user_grace_s: float = 30.0) -> None:
-    """Card bonus, hybrid flow (user directive evolution 2026-07-04): alert the user and
-    give them `user_grace_s` to pick (they're best at it); if they don't act, tap the
-    outlier-heuristic guess — wrong picks still award a lesser prize, so guessing beats
-    stalling an unattended session. Card sprites are ANIMATED (sparkles), so the pixel
-    heuristic is genuinely unreliable — every appearance saves an audit frame to keep
-    improving it offline."""
+def _cardgame(dev, matcher, log=print, should_stop=None) -> None:
+    """Pause farm navigation until the independent monitor clears the card bonus."""
     f = _nav_read(dev)
     if f is None:
         return
@@ -77,38 +74,8 @@ def _cardgame(dev, matcher, log=print, should_stop=None,
     except Exception:
         pass
     i, j, margin = _card_pair(f)
-    # UNATTENDED AUTO-DRAIN (AIFARM_CARD_AUTO=1): when NO human is present the "stand down
-    # and wait" directive below deadlocks the whole session — the farm can never pass a card
-    # game, so no runs happen. In that case tap the outlier-heuristic answer pair each round
-    # to DRAIN the game (a wrong pick still awards a lesser prize; the two-agent spam the
-    # 2026-07-04 directive guarded against can't happen when Claude/user is NOT also tapping).
-    if os.environ.get("AIFARM_CARD_AUTO") == "1":
-        log(f">> card game up — AUTO-DRAIN (unattended): tapping heuristic pair per round.")
-        rounds = 0
-        while not _stop_requested(should_stop) and rounds < 12:
-            f = _nav_read(dev)
-            if f is None:
-                _sleep_interruptible(0.5, should_stop)
-                continue
-            if not matcher.present(f, "cardgame", 0.8):
-                log(">> card game cleared (auto-drain) — resuming.")
-                return
-            i, j, _m = _card_pair(f)
-            cx1, cy1 = _CARD_CENTERS[i]
-            cx2, cy2 = _CARD_CENTERS[j]
-            dev.tap(cx1, cy1)
-            _sleep_interruptible(0.7, should_stop)
-            dev.tap(cx2, cy2)
-            _sleep_interruptible(1.4, should_stop)   # let the round resolve + next board settle
-            rounds += 1
-        log(">> card game auto-drain hit the round cap — leaving it to nav.")
-        return
-    # USER DIRECTIVE (final, 2026-07-04): the bot NEVER taps cards. Two agents acting on
-    # the same card screen (the child's grace-expiry guess + Claude/user solving) caused
-    # random-looking spam across rounds 2-3 — dangerous. The child's ONLY job here is to
-    # stand down completely, announce, and wait; Claude (notified via the log monitor) or
-    # the user does the careful 3-round solve externally.
-    log(f">> card game up — MODEL STOPPED, WAITING FOR YOU/Claude to solve all rounds. "
+    # ponytail: one tap owner is safer than coordinating two independent solvers.
+    log(f">> card game up — MODEL STOPPED, waiting for monitor/user to solve all rounds. "
         f"(heuristic reference only: cards {i+1} & {j+1}, margin {margin:.1f})")
     _alert_user()
     last_ping = time.monotonic()

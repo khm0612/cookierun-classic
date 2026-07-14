@@ -16,7 +16,7 @@ from __future__ import annotations
 import os, sys, json, glob
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
-from _runtime import DATA
+from _runtime import DATA, recording_is_complete
 from cookierun_bot.policies.learned import build_convs
 
 BASE = str(DATA)
@@ -37,6 +37,8 @@ EPOCHS = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 15
 HAZARD_S = float(_farg("--hazard-s", 1.5))
 ENC_INIT = _farg("--enc-init", "iql3")
 VAL_FRAC = float(_farg("--val-frac", 0.25))
+if not 0.0 < VAL_FRAC < 1.0:
+    raise SystemExit("--val-frac must be between 0 and 1")
 OUT = _farg("--out", "hazard")
 # --focal G (default 0.0): focal-loss modulation of the per-sample BCE; 0.0 == plain BCE.
 FOCAL = float(_farg("--focal", 0.0))
@@ -60,6 +62,8 @@ def load_run(rdir):
     if not (os.path.exists(cache) and os.path.exists(fj) and os.path.exists(cp)):
         return None
     fm = json.load(open(fj))
+    if not recording_is_complete(fm):
+        return None
     frames = sorted(fm["frames"], key=lambda f: f["idx"])
     imgs = np.load(cache)
     if len(imgs) != len(frames):
@@ -73,7 +77,29 @@ def load_run(rdir):
     for p in pits:
         lo = np.searchsorted(ts, ts[p] - HAZARD_S)
         y[lo:p + 1] = 1.0
-    return imgs, y, len(pits)
+    return imgs, y, ts, pits
+
+
+def pit_detection_counts(fire, ts, pits, hazard_s):
+    """Count actual pit events, even when their positive approach windows overlap."""
+    hit = total = 0
+    for raw_p in pits:
+        p = int(raw_p)
+        if p < 0 or p >= len(ts) or p >= len(fire):
+            continue
+        total += 1
+        lo = int(np.searchsorted(ts, ts[p] - hazard_s))
+        hit += int(np.asarray(fire[lo:p + 1], dtype=bool).any())
+    return hit, total
+
+
+def validation_run_names(pit_runs, val_frac, rng):
+    """Keep at least one pit-positive run for training and two for honest validation."""
+    if len(pit_runs) < 3:
+        raise SystemExit("hazard training needs at least 3 complete pit-positive runs")
+    order = rng.permutation(len(pit_runs))
+    n_val = min(max(2, int(len(pit_runs) * val_frac)), len(pit_runs) - 1)
+    return {pit_runs[i][0] for i in order[:n_val]}
 
 
 def build_dataset(dirs):
@@ -83,12 +109,12 @@ def build_dataset(dirs):
         r = load_run(d)
         if r is None:
             continue
-        imgs, y, npit = r
-        if npit == 0:
+        imgs, y, ts, pits = r
+        if len(pits) == 0:
             # keep a few pit-free runs as pure negatives, but not the whole 65k-frame demos
             if imgs.shape[0] > 20000:
                 continue
-        runs.append((os.path.basename(d), imgs, y))
+        runs.append((os.path.basename(d), imgs, y, ts, pits))
     return runs
 
 
@@ -152,15 +178,13 @@ def main():
     # run-level split (no frame leakage): hold out whole runs, ensuring val has pits
     pit_runs = [r for r in runs if r[2].sum() > 0]
     rng = np.random.default_rng(0)
-    order = rng.permutation(len(pit_runs))
-    n_val = max(2, int(len(pit_runs) * VAL_FRAC))
-    val_names = {pit_runs[i][0] for i in order[:n_val]}
+    val_names = validation_run_names(pit_runs, VAL_FRAC, rng)
     train = [r for r in runs if r[0] not in val_names]
     val = [r for r in runs if r[0] in val_names]
     tot_pos = int(sum(r[2].sum() for r in runs))
     print(f"runs: {len(runs)} ({len(train)} train / {len(val)} val)  "
           f"positive frames: {tot_pos}  val-run pits: "
-          f"{int(sum(r[2].sum() for r in val))}", flush=True)
+          f"{sum(len(r[4]) for r in val)}", flush=True)
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = HazardNet().to(dev)
@@ -169,7 +193,7 @@ def main():
     # build flat index pools (run_id, frame_i); subsample negatives to 4:1
     def pool(subset, neg_ratio=4):
         pos, neg = [], []
-        for ri, (_, imgs, y) in enumerate(subset):
+        for ri, (_, imgs, y, _ts, _pits) in enumerate(subset):
             p = np.where(y > 0.5)[0]
             n = np.where(y < 0.5)[0]
             pos += [(ri, i) for i in p]
@@ -178,6 +202,8 @@ def main():
         return pos, neg
 
     tr_pos, tr_neg = pool(train)
+    if not tr_pos or not val:
+        raise SystemExit("hazard split must contain positive training and validation runs")
     print(f"train frames: {len(tr_pos)} pos / {len(tr_neg)} neg", flush=True)
     pos_weight = torch.tensor([len(tr_neg) / max(len(tr_pos), 1)], device=dev)
     lossf = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -214,7 +240,7 @@ def main():
         net.eval()
         vp, vy = [], []
         with torch.no_grad():
-            for _, imgs, y in val:
+            for _, imgs, y, _ts, _pits in val:
                 idx = np.arange(len(y))
                 for b in range(0, len(idx), 512):
                     xb = torch.from_numpy(stacks(imgs, idx[b:b + 512])).to(dev).float().div_(255.0)
@@ -246,7 +272,7 @@ def main():
     for thr in (0.7, 0.9, 0.97):
         pits_hit = pits_tot = false_bursts = safe_min = 0
         with torch.no_grad():
-            for name, imgs, y in val:
+            for name, imgs, y, ts, pits in val:
                 idx = np.arange(len(y))
                 pr = []
                 for b in range(0, len(idx), 512):
@@ -254,18 +280,14 @@ def main():
                     pr.append(torch.sigmoid(net(xb)).cpu().numpy())
                 pr = np.concatenate(pr)
                 fire = pr >= thr
-                # per-pit: a pit's approach window is its contiguous run of y==1
-                d = np.diff(np.concatenate([[0], (y > 0.5).astype(int), [0]]))
-                starts, ends = np.where(d == 1)[0], np.where(d == -1)[0]
-                for a, b in zip(starts, ends):
-                    pits_tot += 1
-                    if fire[a:b].any():
-                        pits_hit += 1
+                hit, total = pit_detection_counts(fire, ts, pits, HAZARD_S)
+                pits_hit += hit
+                pits_tot += total
                 # false bursts = fire RISING EDGES that begin on safe ground (bug hunt #10: the
                 # old `fire & safe` rising-edge counted the safe-side tail of a CORRECT on-pit
                 # detection as a fresh alarm; count only edges where fire turns ON while safe).
                 safe = (y < 0.5)
-                fstart = np.where(np.diff(fire.astype(int)) == 1)[0] + 1
+                fstart = np.where(np.diff(np.concatenate([[False], fire]).astype(int)) == 1)[0]
                 false_bursts += int(safe[fstart].sum()) if len(fstart) else 0
                 # true per-run fps (bug hunt #9: hardcoded 50 biased the rate when capture fps
                 # differed, e.g. dxcam ~80 vs the CPU path); _RUN_FPS is filled in load_run.

@@ -25,7 +25,7 @@ Defaults: 20 epochs, every data/<run>/ with frames.json (excluding *test*), geom
 data/demo/model_meta.json, output data/demo/encoder_ssl.pt.
 """
 import os, json, sys, glob, time
-from _runtime import DATA
+from _runtime import DATA, recording_is_complete
 import numpy as np, cv2
 import torch, torch.nn as nn
 from cookierun_bot.policies.learned import build_convs
@@ -75,6 +75,9 @@ x0f, y0f, x1f, y1f = CROP
 IMGS, TS = [], []
 for rdir in runs:
     fm = json.load(open(os.path.join(rdir, "frames.json")))
+    if not recording_is_complete(fm):
+        print(f"  {os.path.basename(rdir)}: incomplete recording, skipped", flush=True)
+        continue
     frames = sorted(fm["frames"], key=lambda f: f["idx"])
     ts = np.array([f["t"] for f in frames])
     # crop is part of the key: same H/W with different crop fractions = different pixels,
@@ -103,6 +106,9 @@ for rdir in runs:
               f"{time.time() - t0:.0f}s", flush=True)
     IMGS.append(imgs)
     TS.append(ts)
+
+if not IMGS:
+    raise SystemExit("no complete recordings to pretrain")
 
 # ---- scroll-speed calibration over the whole corpus (px/sec at model res) --------------
 t0 = time.time()

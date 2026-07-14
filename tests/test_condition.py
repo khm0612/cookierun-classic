@@ -96,12 +96,24 @@ def test_cond_tracker_lifecycle():
     assert v1[2] == 1.0
     v2 = tr.vector(1004.5)                                 # latch expired
     assert v2[2] == 0.0
-    # a 20s decide gap is NORMAL mid-run (BONUSTIME washouts suppress decide() up to 30s)
-    # and must NOT reset run-time; only a >RUN_GAP_RESET_S gap means a new run
+    # Decision gaps are normal mid-run; only an explicit reset marks a new run.
     v3 = tr.vector(1024.5)
     assert v3[0] > 0.2 and v3[1] > 0.0
-    v4 = tr.vector(1024.5 + condition.RUN_GAP_RESET_S + 1)  # true between-runs gap
-    assert v4.tolist() == [0.0, 0.0, 0.0]
+    v4 = tr.vector(1100.0)                         # long mid-run phase gaps keep state
+    assert v4[0] > v3[0] and v4[1] > 0.0
+    tr.reset()                                     # run boundaries reset explicitly
+    assert tr.vector(1101.0).tolist() == [0.0, 0.0, 0.0]
+
+
+def test_cond_tracker_does_not_wipe_new_bonus_after_long_decision_gap():
+    tr = condition.CondTracker(t_norm_s=100.0, speed_norm=100.0, bonus_latch_s=3.0)
+    tr.vector(0.0)
+
+    tr.bonus_seen(61.0)
+    v = tr.vector(61.0)
+
+    assert v[0] == pytest.approx(0.61)
+    assert v[2] == 1.0
 
 
 def test_bonustime_gray_soft_off_without_template():

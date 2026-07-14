@@ -26,7 +26,7 @@ Usage: python scripts/train_iql.py [epochs] [--runs csv] [--encoder-init PATH]
        [--nstep 1] [--cql-alpha 0.0]                            # M3 value-side (n-step + CQL)
 """
 import os, json, sys, glob, time
-from _runtime import DATA
+from _runtime import DATA, recording_is_complete
 import numpy as np, cv2
 import torch, torch.nn as nn
 import torch.nn.functional as F
@@ -104,6 +104,7 @@ else:
     run_dirs += [os.path.join(BASE, r) for r in ("hf2", "hf3", "hf4")
                  if os.path.exists(os.path.join(BASE, r, "frames.json"))]
 print(f"IQL corpus: {[os.path.basename(r) for r in run_dirs]}", flush=True)
+
 
 # HP-bar ROI as fractions of the RAW 960x540 recording (mine_negatives.py calibration)
 _HP_Y0, _HP_Y1, _HP_X0, _HP_X1 = 0.096, 0.141, 0.083, 0.823
@@ -190,6 +191,9 @@ actor_w_all = []                            # M2: per-transition ACTOR-loss weig
 offset = 0
 for rdir in run_dirs:
     fm = json.load(open(os.path.join(rdir, "frames.json")))
+    if not recording_is_complete(fm):
+        print(f"  {os.path.basename(rdir)}: incomplete recording, skipped", flush=True)
+        continue
     frames = sorted(fm["frames"], key=lambda f: f["idx"])
     keys = json.load(open(os.path.join(rdir, "keys.json")))
     ts = np.array([f["t"] for f in frames])
@@ -249,6 +253,8 @@ for rdir in run_dirs:
     run_start.extend([offset] * n)
     offset += n
 
+if not imgs_all:
+    raise SystemExit("no complete recordings to train")
 imgs = np.concatenate(imgs_all)
 act = np.concatenate(act_all)
 rew = np.concatenate(rew_all)

@@ -333,6 +333,54 @@ def test_ensure_running_closes_stray_popup(monkeypatch):
     assert dev.taps == [(30, 40)]
 
 
+def test_ensure_running_blocks_safe_button_when_denylisted_dialog_is_visible(monkeypatch):
+    monkeypatch.setattr(farm, "_sleep_interruptible", lambda *a, **k: None)
+    monkeypatch.setattr(farm, "_wait_for_change", lambda *a, **k: None)
+
+    class Matcher:
+        def present(self, frame, name, threshold=0.8):
+            return name == "buy"
+
+        def find(self, frame, name, threshold=0.8):
+            return (10, 10) if name == "ok" else None
+
+    dev = FakeDevice([np.zeros((100, 100, 3), np.uint8)])
+    dev.taps = []
+    dev.tap = lambda x, y: dev.taps.append((x, y))
+    cfg = type("Cfg", (), {
+        "menu_allowlist": ["ok"],
+        "menu_denylist": ["buy"],
+        "spending": SpendingConfig(),
+    })()
+
+    assert farm.ensure_running(dev, Matcher(), cfg=cfg, tries=4, log=lambda _: None) is False
+    assert dev.taps == []
+
+
+def test_ensure_running_only_taps_actions_in_menu_allowlist(monkeypatch):
+    monkeypatch.setattr(farm, "_sleep_interruptible", lambda *a, **k: None)
+    monkeypatch.setattr(farm, "_wait_for_change", lambda *a, **k: None)
+
+    class Matcher:
+        def present(self, frame, name, threshold=0.8):
+            return False
+
+        def find(self, frame, name, threshold=0.8):
+            return (10, 10) if name == "ok" else None
+
+    dev = FakeDevice([np.zeros((100, 100, 3), np.uint8)])
+    dev.taps = []
+    dev.tap = lambda x, y: dev.taps.append((x, y))
+    cfg = type("Cfg", (), {
+        "menu_allowlist": [],
+        "menu_denylist": [],
+        "spending": SpendingConfig(),
+    })()
+
+    assert farm.ensure_running(dev, Matcher(), cfg=cfg, tries=3, log=lambda _: None) is False
+    assert dev.taps == []
+
+
 def test_ensure_running_drains_gifts_before_menu_navigation(monkeypatch):
     monkeypatch.setattr(farm, "_sleep_interruptible", lambda *a, **k: None)
     calls = []
@@ -424,7 +472,73 @@ def test_play_until_death_never_actions_without_slide_hud(monkeypatch):
     assert dev.holds == []
 
 
-def test_auto_serial_config_switches_stale_single_device(monkeypatch):
+def test_play_until_death_does_not_cut_protected_slide_for_jump(monkeypatch):
+    monkeypatch.setattr(farm, "_sleep_remaining", lambda *a, **k: None)
+    actions = []
+    observed = []
+    monkeypatch.setattr(farm, "apply_action", lambda *a, **k: actions.append(a[1]))
+
+    class ProtectedSlide:
+        held = True
+
+        def __init__(self, **kwargs):
+            pass
+
+        def update(self, *args, **kwargs):
+            self.held = True
+
+        def protecting(self):
+            return True
+
+        def release(self, *args):
+            raise AssertionError("protected slide was released")
+
+        def force_release(self, *args):
+            pass
+
+    monkeypatch.setattr(farm, "SlideHold", ProtectedSlide)
+
+    class Agent:
+        def reset(self):
+            pass
+
+        def decide(self, frame):
+            return farm.ActionDecision(farm.ACTION_JUMP, "test")
+
+    class Matcher:
+        def present(self, frame, name, threshold=0.8):
+            return name == "slide"
+
+        def find(self, frame, name, threshold=0.8):
+            return None
+
+    class Cfg:
+        decision_hz = 60
+        gestures = type("G", (), {"jump_button": (1, 2), "slide_button": (3, 4),
+                                  "slide_hold_ms": 300, "slide_min_hold_s": 1.5})()
+
+    checks = 0
+
+    def stop():
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    farm.play_until_death(
+        FakeDevice([np.zeros((4, 4, 3), np.uint8)]),
+        Cfg(),
+        Agent(),
+        Matcher(),
+        should_stop=stop,
+        log=lambda _: None,
+        on_step=lambda _now, _frame, decision: observed.append(decision.action),
+    )
+
+    assert actions == []
+    assert observed == [farm.ACTION_SLIDE]
+
+
+def test_auto_serial_config_does_not_switch_an_explicit_missing_device(monkeypatch):
     @dataclass(frozen=True)
     class Cfg:
         adb_path: str = ""
@@ -435,8 +549,8 @@ def test_auto_serial_config_switches_stale_single_device(monkeypatch):
 
     cfg = farm._auto_serial_config(Cfg(), log=logs.append)
 
-    assert cfg.device_serial == "127.0.0.1:5555"
-    assert logs == ["[adb] using 127.0.0.1:5555 instead of emulator-5554"]
+    assert cfg.device_serial == "emulator-5554"
+    assert logs == []
 
 
 def test_auto_serial_config_keeps_ambiguous_missing_device(monkeypatch):
@@ -453,7 +567,7 @@ def test_auto_serial_config_keeps_ambiguous_missing_device(monkeypatch):
     assert cfg.device_serial == "missing"
 
 
-def test_buy_double_coins_tracks_spend_before_success(monkeypatch):
+def test_buy_double_coins_never_taps_unbounded_multi_buy(monkeypatch):
     monkeypatch.setattr(farm, "_sleep_interruptible", lambda *a, **k: None)
     dialog = np.full((4, 4, 3), 1, np.uint8)
     banner = np.full((4, 4, 3), 2, np.uint8)
@@ -472,9 +586,8 @@ def test_buy_double_coins_tracks_spend_before_success(monkeypatch):
         log=lambda _: None,
     )
 
-    assert result.active is True
-    assert result.spent == 1200
-    assert dev.taps == [(20, 30)]
+    assert result == farm.BoostResult(False, 0)
+    assert dev.taps == []
 
 
 def test_buy_double_coins_does_not_tap_when_budget_too_low(monkeypatch):
@@ -621,6 +734,40 @@ def test_ensure_running_books_boost_cost_only_when_play_gate_ready(monkeypatch):
     assert cycle["boost_cost"] == 2800
 
 
+def test_ensure_running_blocks_already_checked_tiles_over_cap(monkeypatch):
+    monkeypatch.setattr(farm, "_sleep_interruptible", lambda *a, **k: None)
+    monkeypatch.setattr(farm, "_watch_headstart", lambda *a, **k: False)
+    taps = []
+    monkeypatch.setattr(
+        farm,
+        "_tap_template",
+        lambda dev, matcher, name, thresh=0.72: taps.append(name) or True,
+    )
+
+    class ReadyBoostMatcher:
+        def present(self, frame, name, threshold=0.8):
+            return name in {"tilecheck", "dblbanner"}
+
+        def find(self, frame, name, threshold=0.8):
+            return (100, 100) if name in {"tile_hp", "tile_watch", "tile_x2", "play"} else None
+
+    cfg = type("Cfg", (), {
+        "templates_dir": "",
+        "menu_allowlist": ["start"],
+        "menu_denylist": [],
+        "spending": SpendingConfig(allow_coin_boosts=True, max_boost_cost_per_run=1),
+    })()
+
+    assert farm.ensure_running(
+        FakeDevice([np.zeros((400, 500, 3), np.uint8)]),
+        ReadyBoostMatcher(),
+        cfg=cfg,
+        tries=2,
+        log=lambda _: None,
+    ) is False
+    assert "play" not in taps
+
+
 class TileMatcher:
     """Tile check state encoded in frame[0,0,0]: 0 = tiles unchecked, 1 = checked."""
 
@@ -634,6 +781,24 @@ class TileMatcher:
 
 
 _SPEND = SpendingConfig(allow_coin_boosts=True, max_boost_cost_per_run=12000)
+
+
+def test_ensure_run_boosts_blocks_fixed_tiles_over_per_run_cap(monkeypatch):
+    monkeypatch.setattr(farm, "_sleep_interruptible", lambda *a, **k: None)
+    checked = np.full((400, 400, 3), 1, np.uint8)
+    dev = FakeDevice([checked])
+    dev.taps = []
+    dev.tap = lambda x, y: dev.taps.append((x, y))
+
+    result = farm.ensure_run_boosts(
+        dev,
+        TileMatcher(),
+        SpendingConfig(allow_coin_boosts=True, max_boost_cost_per_run=1),
+        log=lambda _: None,
+    )
+
+    assert result == farm.BoostResult(False, 0)
+    assert dev.taps == []
 
 
 def test_ensure_run_boosts_counts_checked_tiles_without_tapping(monkeypatch):

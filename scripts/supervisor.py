@@ -10,6 +10,8 @@ from _runtime import ROOT
 
 SCRIPT = ROOT / "scripts" / "ai_farm.py"
 REFRESH_EXIT = 17   # ai_farm's "emulator degraded — refresh me" exit code (see ai_farm.py)
+SESSION_ARG = next((arg for arg in sys.argv[2:]
+                    if arg.startswith("--cookierun-session=")), None)
 
 
 def main(target: int = 15) -> int:
@@ -22,7 +24,10 @@ def main(target: int = 15) -> int:
         want = target - done
         print(f"[sup] attempt {attempt}: launching ai_farm for {want} run(s) "
               f"({done}/{target} done, {time.time()-t0:.0f}s elapsed)", flush=True)
-        p = subprocess.Popen([sys.executable, "-u", str(SCRIPT), str(want)],
+        command = [sys.executable, "-u", str(SCRIPT), str(want)]
+        if SESSION_ARG:
+            command.append(SESSION_ARG)
+        p = subprocess.Popen(command,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                              bufsize=1)
         completed = 0
@@ -59,7 +64,7 @@ def main(target: int = 15) -> int:
         time.sleep(5)
     print(f"[sup] FINISHED: {done}/{target} runs over {(time.time()-t0)/60:.0f} min",
           flush=True)
-    return 0
+    return 0 if done >= target else 1
 
 
 if __name__ == "__main__":

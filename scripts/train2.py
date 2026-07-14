@@ -1,5 +1,5 @@
 import os, json, sys, time, glob
-from _runtime import DATA, ROOT
+from _runtime import DATA, ROOT, recording_is_complete
 import numpy as np, cv2
 import torch, torch.nn as nn
 from cookierun_bot.policies.learned import build_net_from_meta
@@ -297,6 +297,16 @@ else:
     runs = sorted(d for d in glob.glob(os.path.join(BASE, "demo*"))     # default: the 35fps demo* set
                   if os.path.isdir(d) and os.path.exists(os.path.join(d, "frames.json"))
                   and "test" not in os.path.basename(d))
+complete_runs = []
+for rdir in runs:
+    metadata = json.load(open(os.path.join(rdir, "frames.json")))
+    if recording_is_complete(metadata):
+        complete_runs.append(rdir)
+    else:
+        print(f"  {os.path.basename(rdir)}: incomplete recording, skipped", flush=True)
+runs = complete_runs
+if not runs:
+    raise SystemExit("no complete recordings to train")
 print("runs:", [os.path.basename(r) for r in runs], flush=True)
 
 wandb = None

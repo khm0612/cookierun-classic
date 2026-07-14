@@ -1,4 +1,5 @@
 import numpy as np
+from dataclasses import replace
 from cookierun_bot.config import Region, Config, Gestures, RewardWeights
 from cookierun_bot.menu import MenuNavigator
 
@@ -43,3 +44,23 @@ def test_idle_when_nothing_present(fake_device):
     m = StubMatcher(present_names=[])
     nav = MenuNavigator(fake_device, m, _cfg())
     assert nav.advance(np.zeros((100, 100, 3), np.uint8)) == "idle"
+
+
+def test_forbid_crystals_blocks_revive_even_when_not_in_denylist(fake_device):
+    cfg = replace(_cfg(), menu_denylist=[])
+    m = StubMatcher(present_names=["revive_crystals"], points={"ok": (5, 5)})
+    nav = MenuNavigator(fake_device, m, cfg)
+
+    assert nav.advance(np.zeros((100, 100, 3), np.uint8)) == "spend_blocked"
+    assert fake_device.taps == []
+
+
+def test_legacy_allowlist_names_map_only_to_equivalent_safe_actions(fake_device):
+    nav = MenuNavigator(fake_device, StubMatcher([]), _cfg())
+
+    assert nav.is_allowed("play") is True       # start/restart/replay
+    assert nav.is_allowed("openall") is False   # collect is absent from this fixture
+    assert nav.is_allowed("confirm") is False   # ok must not authorize generic confirms
+
+    collect_cfg = replace(_cfg(), menu_allowlist=["collect"])
+    assert MenuNavigator(fake_device, StubMatcher([]), collect_cfg).is_allowed("openall") is True

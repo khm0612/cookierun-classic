@@ -6,6 +6,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from cookierun_bot.policies import condition, learned
 from cookierun_bot.policies.learned import build_convs, build_net_from_meta, LearnedAgent
 
 FILM_META = {
@@ -82,3 +83,33 @@ def test_plain_small_cnn_checkpoints_still_load():
     keys = list(net.state_dict().keys())
     assert keys[0] == "0.weight" and any(k.startswith("9.") or k.startswith("11.")
                                          for k in keys)
+
+
+def test_continuous_slide_predictions_remain_slide(monkeypatch):
+    agent = LearnedAgent.__new__(LearnedAgent)
+    agent._torch = torch
+    agent._stack = lambda frame: np.zeros((1, 1, 1, 1), np.float32)
+    agent._device = torch.device("cpu")
+    agent._cond_meta = None
+    agent._net = lambda x: torch.tensor([[0.0, 0.0, 10.0]])
+    agent.classes = ["none", "jump", "slide"]
+    agent._conf = agent._conf_slide = 0.6
+    agent.explore = 0.0
+    agent._cd_until = 0.0
+    times = iter([1.0, 1.1])
+    monkeypatch.setattr(learned.time, "monotonic", lambda: next(times))
+
+    assert agent.decide(None).action == 2
+    assert agent.decide(None).action == 2
+
+
+def test_passive_observe_advances_film_run_clock(monkeypatch):
+    agent = LearnedAgent.__new__(LearnedAgent)
+    agent._cond_meta = {"dims": ["t", "speed", "bonus"]}
+    agent._cond = condition.CondTracker(t_norm_s=100.0)
+    agent._stack = lambda frame: None
+    monkeypatch.setattr(learned.time, "monotonic", lambda: 10.0)
+
+    agent.observe(None)
+
+    assert agent._cond.vector(20.0)[0] == pytest.approx(0.1)

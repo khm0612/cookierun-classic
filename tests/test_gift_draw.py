@@ -124,6 +124,23 @@ def test_draw_gifts_uses_box_fallback_only_on_verified_picker():
     assert dev.taps[:2] == [(0, 30, 89), (1, 30, 50)]
 
 
+def test_draw_gifts_does_not_claim_depleted_when_step_limit_expires():
+    dev = GiftPickOnlyDevice()
+    clock = FakeClock()
+
+    result = draw_gifts(
+        dev,
+        GiftPickOnlyMatcher(),
+        log=lambda _: None,
+        max_steps=2,
+        sleep=clock.sleep,
+        now=clock.now,
+    )
+
+    assert result.draws == 1
+    assert result.depleted is False
+
+
 class RewardRevealDevice:
     def __init__(self):
         self.state = 0

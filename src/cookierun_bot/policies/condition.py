@@ -109,17 +109,10 @@ def estimate_scroll(prev_small, cur_small, scroll_v: int = 1) -> "float | None":
     return float(min(abs(dx), a.shape[1] * 0.25))
 
 
-RUN_GAP_RESET_S = 60.0   # decide()-gap that implies a NEW run. Must exceed the ~30s
-                         # HUD-absent stretches where farm._run_loop legitimately skips
-                         # decide() MID-RUN (BONUSTIME washouts, scooter rides) — every
-                         # run-entry path calls agent.reset() anyway, so this is only a
-                         # safety net for a missed reset, not the primary mechanism.
-
-
 class CondTracker:
     """Live-side conditioning state for LearnedAgent. Feed it stack-slot transitions via
-    on_slot(); read the vector per decision via vector(now). A >RUN_GAP_RESET_S gap between
-    decisions auto-resets (a new run started without an explicit reset())."""
+    on_slot(); read the vector per decision via vector(now). Run boundaries reset explicitly
+    through ``LearnedAgent.reset()``; idle phases inside one run preserve this state."""
 
     def __init__(self, t_norm_s=T_NORM_S, speed_norm=1.0, bonus_latch_s=BONUS_LATCH_S,
                  ema=SPEED_EMA, scroll_v=1):
@@ -134,7 +127,6 @@ class CondTracker:
         self._t0 = None
         self._speed = None            # px/sec EMA, None until first measurement
         self._bonus_seen = -1e9
-        self._last = None
 
     def on_slot(self, prev_small, new_small, dt: float) -> None:
         """Called when the agent appends a NEW frame-stack slot (prev/new at model res)."""
@@ -151,9 +143,6 @@ class CondTracker:
         self._bonus_seen = now
 
     def vector(self, now: float) -> np.ndarray:
-        if self._last is not None and now - self._last > RUN_GAP_RESET_S:
-            self.reset()              # decision gap => new run without an explicit reset
-        self._last = now
         if self._t0 is None:
             self._t0 = now
         t = min((now - self._t0) / self.t_norm_s, 1.0)

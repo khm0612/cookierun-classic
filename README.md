@@ -2,14 +2,19 @@
 
 Local CookieRun Classic farming controller for an Android emulator.
 
-## Current Local Setup
+## Expected Local Setup
 
-- ADB auto-selects the single ready emulator if the configured serial is stale.
-- Capture size is `2560x1440`.
-- `config.yaml` is set to `capture: ldplayer`, `max_fps: 120`, `decision_hz: 60`, and coin boosts enabled.
-- Button, result, digit, and Double Coins boost templates are present under `templates/`.
-- Live proof on 2026-07-03: the settled Result-screen coin crop read matched the
-  screenshot at `108,452` coins.
+- A blank ADB serial auto-selects the first ready emulator. An explicit serial fails closed
+  when that device is missing; it is never replaced with a different connected device.
+- LDPlayer capture and local templates are calibrated for `2560x1440`.
+- The recommended LDPlayer settings are `capture: ldplayer`, `max_fps: 120`, and
+  `decision_hz: 60`. Coin spending remains opt-in.
+
+`config.yaml`, `templates/`, and `data/` are machine-local and ignored by Git. A clean clone
+does **not** include calibrated templates, recordings, or a trained model. Before farming,
+copy your local `config.yaml` and `templates/` into the repo. Learned-agent runs also need
+`data/demo/model.pt` plus `data/demo/model_meta.json`; restore those files or record and train
+them with the runbook.
 
 ## Run Path
 
@@ -86,6 +91,16 @@ From Explorer you can also launch:
 
 `CookieGame.bat` prefers `.venv\Scripts\python.exe`, so the one-click app uses the same
 dependencies installed by `install.ps1`.
+
+For the optional Android Wi-Fi bridge, copy the token displayed by the bridge app before
+starting the PC client:
+
+```powershell
+$env:COOKIERUN_BRIDGE_TOKEN = "token-shown-on-phone"
+```
+
+The token is required for every connection. Treat it as a session password and use the
+bridge only on a trusted local network.
 
 The controller wraps the same `farm.py` engine, shows run totals, gross/net coins,
 ingredients/hr, ADB path/device/run-count controls, device/boost/action checks, and live

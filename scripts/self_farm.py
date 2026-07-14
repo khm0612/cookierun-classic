@@ -47,6 +47,22 @@ from cookierun_bot import farm
 from cookierun_bot.farm_common import _in_run
 
 
+_PIT_TPL = cv2.imread(str(ROOT / "templates" / "pitlift_norm.png"), cv2.IMREAD_GRAYSCALE)
+
+
+def _pitfall(frame) -> bool:
+    if _PIT_TPL is None:
+        return False
+    h, w = frame.shape[:2]
+    crop = cv2.cvtColor(
+        frame[int(h * 0.830):int(h * 0.956), int(w * 0.372):int(w * 0.684)],
+        cv2.COLOR_BGR2GRAY,
+    )
+    crop = cv2.resize(crop, (_PIT_TPL.shape[1], _PIT_TPL.shape[0]),
+                      interpolation=cv2.INTER_AREA)
+    return float(cv2.matchTemplate(crop, _PIT_TPL, cv2.TM_CCOEFF_NORMED)[0, 0]) >= 0.55
+
+
 def _arg(flag, default):
     for a in sys.argv:
         if a.startswith(flag + "="):
@@ -160,14 +176,26 @@ def _launch_monitor():
     """(Re)start the independent card-game solver. Its own adb screencap grabber — no dxcam
     contention with the farm. Returns the Popen (or None on failure)."""
     try:
-        p = subprocess.Popen([PY, "-u", "scripts/monitor.py"], cwd=str(ROOT),
-                             stdout=open(str(ROOT / "selffarm_monitor.out"), "a"),
-                             stderr=subprocess.STDOUT)
+        with open(str(ROOT / "selffarm_monitor.out"), "a") as log_fh:
+            p = subprocess.Popen([PY, "-u", "scripts/monitor.py"], cwd=str(ROOT),
+                                 stdout=log_fh, stderr=subprocess.STDOUT)
+        try:
+            rc = p.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            rc = None
+        if rc is not None:
+            print(f"!! monitor exited during startup (rc={rc}) -- emulator may be owned elsewhere",
+                  flush=True)
+            return None
         print(">> card-game solver (monitor.py) launched", flush=True)
         return p
     except Exception as e:
         print(f"!! monitor launch failed (cards won't auto-solve): {e}", flush=True)
         return None
+
+
+def _recording_usable(complete, duration, frame_count):
+    return bool(complete) and duration >= MIN_DUR_S and frame_count >= MIN_FRAMES
 
 
 def activate_headstart():
@@ -195,34 +223,50 @@ def make_recorder(run_dir):
     fdir = os.path.join(run_dir, "frames")
     os.makedirs(fdir, exist_ok=True)
     wq = queue.Queue(maxsize=512)
+    frames, keys, pit_times = [], [], []
+    frames_lock = threading.Lock()
+    accept_results = [True]
+    writer_error = [None]
 
     def writer():
         while True:
             item = wq.get()
-            if item is None:
-                break
-            idx, small = item
             try:
-                cv2.imwrite(os.path.join(fdir, f"{idx:06d}.jpg"), small, [cv2.IMWRITE_JPEG_QUALITY, 88])
-            except Exception:
-                pass    # a single lost frame must never take down the writer thread
+                if item is None:
+                    return
+                idx, timestamp, small = item
+                written = cv2.imwrite(os.path.join(fdir, f"{idx:06d}.jpg"), small,
+                                      [cv2.IMWRITE_JPEG_QUALITY, 88])
+                if not written:
+                    raise OSError(f"failed to write frame {idx}")
+                with frames_lock:
+                    if accept_results[0]:
+                        frames.append({"idx": idx, "t": timestamp})
+            except Exception as exc:
+                with frames_lock:
+                    if writer_error[0] is None:
+                        writer_error[0] = exc
+            finally:
+                wq.task_done()
     # ONE JPEG writer maxes ~47fps; a 60fps recording needs a small POOL or it drops frames, which
     # would make the recorded self-run's effective fps < the model's meta fps (out-of-distribution).
     _tws = [threading.Thread(target=writer, daemon=True) for _ in range(4 if SAVE_FPS >= 50 else 1)]
     for _tw in _tws:
         _tw.start()
 
-    st = {"idx": 0, "last": 0.0, "cur": ACTION_NOOP}
-    frames, keys = [], []
+    st = {"idx": 0, "last": 0.0, "cur": ACTION_NOOP, "last_seen": 0.0, "last_pit": -9.0}
     gap = 1.0 / SAVE_FPS
 
     def on_step(now, f, decision):
+        st["last_seen"] = now
+        if now - st["last_pit"] > 4.0 and _pitfall(f):
+            st["last_pit"] = now
+            pit_times.append(now)
         if now - st["last"] >= gap:
             h, w = f.shape[:2]
             small = cv2.resize(f, (SAVE_W, int(h * SAVE_W / w)))
             try:
-                wq.put_nowait((st["idx"], small))
-                frames.append({"idx": st["idx"], "t": now})
+                wq.put_nowait((st["idx"], now, small))
                 st["idx"] += 1
             except queue.Full:
                 pass
@@ -235,11 +279,24 @@ def make_recorder(run_dir):
                 keys.append({"t": now, "action": "jump" if a == ACTION_JUMP else "slide", "dur": 0.0})
             st["cur"] = a
 
-    def close():
-        for _ in _tws:
-            wq.put(None)
+    def close(timeout=5.0):
+        if st["cur"] in (ACTION_JUMP, ACTION_SLIDE) and keys:
+            keys[-1]["dur"] = round(max(0.0, st["last_seen"] - keys[-1]["t"]), 4)
+        deadline = time.monotonic() + timeout
+        sentinels = 0
+        while sentinels < len(_tws) and time.monotonic() < deadline:
+            try:
+                wq.put(None, timeout=min(0.1, max(0.0, deadline - time.monotonic())))
+                sentinels += 1
+            except queue.Full:
+                continue
         for _tw in _tws:
-            _tw.join(timeout=5)
+            _tw.join(timeout=max(0.0, deadline - time.monotonic()))
+        closed = all(not _tw.is_alive() for _tw in _tws)
+        with frames_lock:
+            accept_results[0] = False
+            frames.sort(key=lambda frame: frame["idx"])
+        return closed, list(pit_times), writer_error[0]
     return on_step, frames, keys, close
 
 
@@ -391,6 +448,9 @@ try:
 except OSError:                                    # monitor left behind (else nav's first BACK is
     pass                                           # wrongly vetoed for up to 90s)
 monitor = _launch_monitor()
+if monitor is None:
+    dev.stop()
+    raise SystemExit("card-game monitor unavailable -- refusing to share the emulator")
 wallet0 = farm.read_wallet(dev, cfg, matcher)
 print(f">> SELF-FARM start | wallet {wallet0} | arch {ARCH} K{_base_k()} | ASYNC retrain every "
       f"{RETRAIN_EVERY} runs, keep {KEEP_TOP} | save {SAVE_FPS}fps | "
@@ -408,9 +468,11 @@ try:
                 if monitor_restarts < MONITOR_MAX_RESTARTS:
                     monitor_restarts += 1
                     monitor = _launch_monitor()
+                    if monitor is None:
+                        raise SystemExit("card-game monitor unavailable -- stopping self-farm")
                     print(f">> monitor.py had died -> relaunched (#{monitor_restarts})", flush=True)
                 else:
-                    print("!! monitor.py dead + restart cap reached — cards may stall", flush=True)
+                    raise SystemExit("monitor.py restart cap reached -- stopping self-farm")
 
             # 0b. self-heal: if a stray BACK (or crash) kicked us out to the Android launcher,
             #     relaunch CookieRun so a card-screen wedge can't strand the farm idle for hours.
@@ -495,13 +557,21 @@ try:
                 dur = farm.play_until_death(dev, cfg, agent, matcher, max_s=1800, min_s=8.0,
                                             log=lambda *a: None, on_step=on_step)
             finally:
-                close()
+                recording_closed, pit_times, recording_error = close()
+            complete = recording_closed and recording_error is None and bool(frames)
+            with open(os.path.join(run_dir, "frames.json"), "w") as fh:
+                json.dump({"frames": frames, "save_w": SAVE_W, "duration_s": dur,
+                           "actual_fps": round(len(frames) / max(dur, 0.1), 1),
+                           "pit_times": pit_times, "complete": complete}, fh)
+            with open(os.path.join(run_dir, "keys.json"), "w") as fh:
+                json.dump(keys, fh)
+            if not complete:
+                print(f"!! recording incomplete -- excluded from training: "
+                      f"{recording_error or 'writer did not stop/empty capture'}", flush=True)
+            if not recording_closed or recording_error is not None:
+                raise SystemExit("recording writer failed -- stopping self-farm")
             res = farm.read_run_result(dev, cfg, matcher)
             coins = res.get("coins", 0) if res.get("read_ok") else None
-            json.dump({"frames": frames, "save_w": SAVE_W, "duration_s": dur,
-                       "actual_fps": round(len(frames) / max(dur, 0.1), 1)},
-                      open(os.path.join(run_dir, "frames.json"), "w"))
-            json.dump(keys, open(os.path.join(run_dir, "keys.json"), "w"))
             jz = sum(1 for k in keys if k["action"] == "jump")
             print(f">> run {run_id}: {dur:.0f}s | coins {coins} | jump {jz} slide {len(keys)-jz} | "
                   f"fps {round(len(frames)/max(dur,0.1),1)} | "
@@ -513,9 +583,10 @@ try:
 
             # 4. degenerate-run floor — never train on it; and if the game has CRASHED to the
             #    launcher (repeated 0s runs), restart the game app so we don't spin the night away
-            if dur < MIN_DUR_S or len(frames) < MIN_FRAMES:
+            if not _recording_usable(complete, dur, len(frames)):
                 consec_degen += 1
-                print(f">> run {run_id} degenerate (dur={dur:.0f}s frames={len(frames)}) — dropped (#{consec_degen})", flush=True)
+                print(f">> run {run_id} unusable (complete={complete} dur={dur:.0f}s "
+                      f"frames={len(frames)}) — dropped (#{consec_degen})", flush=True)
                 shutil.rmtree(run_dir, ignore_errors=True)
                 if consec_degen % DEGEN_ESCALATE == 0:
                     tier = consec_degen // DEGEN_ESCALATE

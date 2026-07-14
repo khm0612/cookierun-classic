@@ -27,6 +27,15 @@ def test_none_coins_counts_zero_delta():
     assert rt.update(coins=None, boxes=0, dead=False) == 0.01
 
 
+def test_ocr_regression_does_not_double_award_on_recovery():
+    rt = RewardTracker(_w())
+    rt.reset()
+
+    rt.update(coins=100, boxes=5, dead=False)
+    assert rt.update(coins=40, boxes=2, dead=False) == 0.01
+    assert rt.update(coins=105, boxes=6, dead=False) == 5.0 + 50.0 + 0.01
+
+
 def test_death_applies_penalty_and_no_survive_bonus():
     rt = RewardTracker(_w())
     rt.reset()

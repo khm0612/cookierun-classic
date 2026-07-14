@@ -213,18 +213,10 @@ class LearnedAgent:
         # frames so a self-farm run can stumble into better timings; survival then keeps the good
         # ones. 0 = pure greedy (banking). Set per-run by the farm; confident dodges stay greedy.
         self.explore = 0.0
-        # Slide gets its OWN cooldown ~= its hold duration. play_until_death re-decides per
-        # frame and each SLIDE re-issues device.hold(...slide_hold_ms) fire-and-forget, so an
-        # ungated high-conf slide at 60-270fps queues many overlapping holds = seconds of
-        # continuous LOW posture (over-slides through a platform gap = pit death) + an adb
-        # backlog. Don't re-issue a slide while the previous hold is still in flight.
-        self._slide_cd_s = getattr(getattr(cfg, "gestures", None), "slide_hold_ms", 500) / 1000.0
-        self._slide_cd_until = 0.0
 
     def reset(self) -> None:
         self._buf.clear()
         self._cd_until = 0.0
-        self._slide_cd_until = 0.0
         self._last_stacked = 0.0
         if self._cond_meta:
             self._cond.reset()
@@ -264,6 +256,9 @@ class LearnedAgent:
         wrapper keep an idle model's temporal state warm so a hand-off is never fed a
         stale/duplicated K-stack (policies/hybrid_phase.py)."""
         self._stack(frame)
+        if self._cond_meta:
+            # ponytail: reading the vector is enough to advance the idle model's run clock.
+            self._cond.vector(time.monotonic())
 
     def decide(self, frame) -> ActionDecision:
         x = self._torch.from_numpy(self._stack(frame)).to(self._device)
@@ -310,10 +305,6 @@ class LearnedAgent:
             if now < self._cd_until:
                 return ActionDecision(ACTION_NOOP, "model:jump-cooldown")
             self._cd_until = now + self._jump_cd_s
-        elif action == ACTION_SLIDE:
-            if now < self._slide_cd_until:
-                return ActionDecision(ACTION_NOOP, "model:slide-cooldown")
-            self._slide_cd_until = now + self._slide_cd_s
         return ActionDecision(action, f"model:{cls}:{p[i]:.2f}")
 
     def act(self, frame) -> int:
