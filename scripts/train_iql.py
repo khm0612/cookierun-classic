@@ -22,6 +22,7 @@ LearnedAgent unchanged (arch small_cnn, no cond).
 Usage: python scripts/train_iql.py [epochs] [--runs csv] [--encoder-init PATH]
        [--gamma 0.995] [--tau 0.7] [--beta 3.0] [--out-prefix iql]
        [--pit-r -4.0] [--pit-spread 1.0] [--pit-oversample 1]
+       [--mask-hits 0.0] [--human-weight 1.0] [--min-quality]   # M2 selective imitation
 """
 import os, json, sys, glob, time
 from _runtime import DATA
@@ -65,6 +66,19 @@ PIT_SPREAD = float(_farg("--pit-spread", 1.0))
 # (1 = off). Q/V/policy all draw batches from that one pool, so the critics see the same
 # oversampling as the actor — least-invasive for the GPU-resident gather pipeline.
 PIT_OVERSAMPLE = max(int(_farg("--pit-oversample", 1)), 1)
+# --- M2 selective imitation (all default to NO-OP so iql3 behaviour is exactly preserved) ---
+# Turn 2 (more unfiltered bot data) plateaued because AWBC imitates whatever the recording did,
+# and the bot's recordings are mostly its own flaws. These three knobs bias the ACTOR loss only
+# (the Q/V critics still see everything, so the reward signal is untouched):
+#   --mask-hits S   : zero the actor weight on the S seconds BEFORE each mined hit (those actions
+#                     caused the hit — stop cloning them).
+#   --human-weight W: multiply the actor weight by W for the human demos (hf2/hf3/hf4), so the
+#                     near-optimal human prior is not drowned by bot self-play.
+#   --min-quality   : drop bot runs with >1 pit fall from the corpus entirely (human runs kept).
+MASK_HITS = float(_farg("--mask-hits", 0.0))
+HUMAN_WEIGHT = float(_farg("--human-weight", 1.0))
+MIN_QUALITY = "--min-quality" in sys.argv[1:]
+_HUMAN = ("hf2", "hf3", "hf4")
 torch.manual_seed(0)
 
 meta = json.load(open(os.path.join(BASE, "demo", "model_meta.json")))
@@ -163,6 +177,7 @@ def hit_frames(ts, hp):
 
 
 imgs_all, act_all, rew_all, run_start, pit_win_all = [], [], [], [], []
+actor_w_all = []                            # M2: per-transition ACTOR-loss weight (1.0 = default)
 offset = 0
 for rdir in run_dirs:
     fm = json.load(open(os.path.join(rdir, "frames.json")))
@@ -199,6 +214,10 @@ for rdir in run_dirs:
     hidx = hit_frames(ts, hp)
     rew[hidx] += HIT_R
     pidx = mine_pits(rdir, frames, ts)
+    is_human = os.path.basename(rdir) in _HUMAN
+    if MIN_QUALITY and not is_human and len(pidx) > 1:
+        print(f"  (min-quality: SKIP {os.path.basename(rdir)} — {len(pidx)} falls)", flush=True)
+        continue
     # penalize the frames LEADING INTO the fall (the prompt shows ~0.5-1s after the miss;
     # the mistimed/missing jump happened ~0.5s earlier) so credit lands on the decision
     for pi in pidx:
@@ -206,15 +225,25 @@ for rdir in run_dirs:
         rew[lo:pi + 1] += PIT_R / max(pi + 1 - lo, 1)
         pit_win_all.append(np.arange(lo, pi + 1, dtype=np.int64) + offset)
     rew[-1] += DEATH_R                     # run end = death (or the human stopped: close enough)
+    # M2: ACTOR-loss weight (1.0 = default). mask-hits zeros the pre-hit window; human-weight
+    # scales the human demos. Applied ONLY to the policy loss, so the critics are unaffected.
+    aw = np.ones(n, np.float32)
+    if MASK_HITS > 0:
+        for hi in hidx:
+            lo = np.searchsorted(ts, ts[hi] - MASK_HITS)
+            aw[lo:hi + 1] = 0.0
+    if is_human and HUMAN_WEIGHT != 1.0:
+        aw *= HUMAN_WEIGHT
     print(f"  {os.path.basename(rdir)}: {n} frames | {len(hidx)} hits | {len(pidx)} PIT FALLS | "
           f"actions {dict(zip(CLASSES, np.bincount(act, minlength=3).tolist()))}", flush=True)
-    imgs_all.append(imgs); act_all.append(act); rew_all.append(rew)
+    imgs_all.append(imgs); act_all.append(act); rew_all.append(rew); actor_w_all.append(aw)
     run_start.extend([offset] * n)
     offset += n
 
 imgs = np.concatenate(imgs_all)
 act = np.concatenate(act_all)
 rew = np.concatenate(rew_all)
+actor_w = np.concatenate(actor_w_all)       # M2 per-transition policy-loss weight (default all 1)
 run_start = np.array(run_start)
 n = len(act)
 # terminal mask: last frame of each run has no successor
@@ -234,6 +263,7 @@ start_g = torch.from_numpy(run_start).to(dev)
 act_g = torch.from_numpy(act).to(dev)
 rew_g = torch.from_numpy(rew).to(dev)
 term_g = torch.from_numpy(is_term).to(dev)
+actor_w_g = torch.from_numpy(actor_w).to(dev)   # M2 policy-loss weight (all 1.0 by default)
 
 
 def stacks(i):
@@ -270,6 +300,7 @@ opt_v = torch.optim.Adam(vf.parameters(), 3e-4)
 opt_p = torch.optim.Adam(pi.parameters(), 3e-4)
 print(f"IQL: gamma={GAMMA} tau={TAU} beta={BETA} epochs={EPOCHS} "
       f"pit_spread={PIT_SPREAD} pit_oversample={PIT_OVERSAMPLE} "
+      f"mask_hits={MASK_HITS} human_weight={HUMAN_WEIGHT} min_quality={MIN_QUALITY} "
       f"encoder={'ssl' if ENC else 'scratch'}", flush=True)
 
 BATCH = 256
@@ -310,7 +341,7 @@ for ep in range(EPOCHS):
             adv = qmin - vf(s).squeeze(1)
             wgt = torch.exp(BETA * adv).clamp(max=100.0)
         logp = F.log_softmax(pi(s), dim=1).gather(1, a[:, None]).squeeze(1)
-        lp = -(wgt * logp).mean()
+        lp = -(wgt * actor_w_g[i] * logp).mean()   # M2: actor_w defaults to 1.0 (no-op)
         opt_p.zero_grad(); lp.backward(); opt_p.step()
         # polyak targets
         with torch.no_grad():
