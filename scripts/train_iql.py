@@ -361,14 +361,17 @@ for ep in range(EPOCHS):
         r = rew_g[i]
         with torch.no_grad():
             if NSTEP != 1:
-                # n-step target: precomputed discounted reward sum + GAMMA^m V(s_{i+m}),
-                # m clamped so the bootstrap frame stays in-run (see the precompute above).
-                vnext = vf(stacks(nstep_boot_g[i])).squeeze(1)
-                q_tgt = nstep_disc_rew_g[i] + nstep_gpow_g[i] * vnext
-            else:                                          # default: exact 1-step target (unchanged)
-                sp = stacks(i + 1)
-                vnext = vf(sp).squeeze(1)
-                q_tgt = r + GAMMA * vnext
+                boot = nstep_boot_g[i]; base_r = nstep_disc_rew_g[i]; gpow = nstep_gpow_g[i]
+            else:
+                boot = i + 1; base_r = r; gpow = GAMMA
+            vnext = vf(stacks(boot)).squeeze(1)
+            # DONE-MASK FIX (bug hunt 2026-07-14): when the bootstrap frame is a run-terminal,
+            # V(terminal) is an UNTRAINED output (terminals are excluded from `valid`, so V never
+            # learns them) and the terminal reward — which carries DEATH_R=-5 — was never used in
+            # any target. Bootstrap the terminal's OWN reward instead of the garbage V, so the
+            # death penalty finally trains. Non-terminal successors keep the normal V bootstrap.
+            bootstrap = torch.where(term_g[boot], rew_g[boot], vnext)
+            q_tgt = base_r + gpow * bootstrap
             qmin = torch.minimum(q1t(s).gather(1, a[:, None]).squeeze(1),
                                  q2t(s).gather(1, a[:, None]).squeeze(1))
         # V: expectile regression toward min target-Q

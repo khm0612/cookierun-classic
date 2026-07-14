@@ -20,6 +20,7 @@ from _runtime import DATA
 from cookierun_bot.policies.learned import build_convs
 
 BASE = str(DATA)
+_RUN_FPS = {}                                # per-run measured capture fps (filled by load_run)
 
 
 def _farg(flag, default):
@@ -64,6 +65,8 @@ def load_run(rdir):
     if len(imgs) != len(frames):
         return None
     ts = np.array([f["t"] for f in frames], np.float64)
+    if len(ts) > 1:                          # true capture fps for the false-fire-rate metric (#9)
+        _RUN_FPS[os.path.basename(rdir)] = float((len(ts) - 1) / max(ts[-1] - ts[0], 1e-6))
     pits = np.load(cp).astype(int)
     # label = 1 for frames within HAZARD_S BEFORE a pit-lift prompt (the approach window)
     y = np.zeros(len(frames), np.float32)
@@ -258,11 +261,15 @@ def main():
                     pits_tot += 1
                     if fire[a:b].any():
                         pits_hit += 1
-                # false bursts = rising edges of fire on safe (y==0) ground; ~50fps assumed
+                # false bursts = fire RISING EDGES that begin on safe ground (bug hunt #10: the
+                # old `fire & safe` rising-edge counted the safe-side tail of a CORRECT on-pit
+                # detection as a fresh alarm; count only edges where fire turns ON while safe).
                 safe = (y < 0.5)
-                fe = fire & safe
-                false_bursts += int(((np.diff(fe.astype(int)) == 1)).sum())
-                safe_min += safe.sum() / 50.0 / 60.0
+                fstart = np.where(np.diff(fire.astype(int)) == 1)[0] + 1
+                false_bursts += int(safe[fstart].sum()) if len(fstart) else 0
+                # true per-run fps (bug hunt #9: hardcoded 50 biased the rate when capture fps
+                # differed, e.g. dxcam ~80 vs the CPU path); _RUN_FPS is filled in load_run.
+                safe_min += safe.sum() / _RUN_FPS.get(name, 50.0) / 60.0
         print(f"  @{thr}: per-pit recall {pits_hit}/{pits_tot} "
               f"({100*pits_hit/max(pits_tot,1):.0f}%)  |  false-fire {false_bursts/max(safe_min,1e-6):.1f} bursts/min",
               flush=True)
