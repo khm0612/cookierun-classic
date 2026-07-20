@@ -76,8 +76,14 @@ Post-revive clustering: **67%** (32/48 non-first falls within 8s of the previous
 character revives at/just-before the same hazard and re-falls. Well above the 30% threshold.
 
 **RE-PRIORITIZED next steps (supersedes the old M1.2 gate-schedule plan):**
-1. **[demoted] Gate schedule** — only 5 NEAR falls could benefit; not worth a night. Skip
-   unless it rides along free with something else.
+1. **[DONE 2026-07-20, re-promoted + DEPLOYED] Gate schedule + post-fall caution** — the
+   2026-07-17 25-run corpus re-ran the forensics (fresh windows `150-165` + `225-315`, 72%
+   post-revive clustering) and the build was cheap after all (~40 lines in ai_farm:
+   `AIFARM_GATE_SCHEDULE` / `AIFARM_POSTFALL_S` / `AIFARM_POSTFALL_HAZTHR`, stateless
+   per-frame min-against-original). Same-session A/B on the iql5b stack: PITS 2.75 vs 3.0
+   and **survival 247s vs 175s (+41%)** — notably it acted as a resilience backstop while
+   external GPU load starved the async hazard (fires 10-13 vs 1-6). Deployed via
+   hybrid.json `gate_schedule`/`postfall_s`.
 2. **Post-revive forced-jump heuristic** (cheap, model-independent, ~15 lines in ai_farm):
    when `pitfall()` fires, script a single cautionary jump ~0.8-1.2s after the revive
    resumes. Attacks the 67% clustering WITHOUT needing the model to see the pit. Needs a

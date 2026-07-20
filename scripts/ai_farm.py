@@ -224,6 +224,12 @@ if not _HYBRID and os.path.exists(_HYB_FILE):
         os.environ.setdefault("AIFARM_HAZARD", str(_hj["hazard"]))
         if _hj.get("hazard_thr") is not None:
             os.environ.setdefault("AIFARM_HAZARD_THR", str(_hj["hazard_thr"]))
+    # DURABLE M1.2 deploy: {"gate_schedule":"150-165:0.35,225-315:0.35","postfall_s":8}
+    # in hybrid.json arms the fall-forensics gate windows + post-fall caution below.
+    if _hj.get("gate_schedule"):
+        os.environ.setdefault("AIFARM_GATE_SCHEDULE", str(_hj["gate_schedule"]))
+    if _hj.get("postfall_s") is not None:
+        os.environ.setdefault("AIFARM_POSTFALL_S", str(_hj["postfall_s"]))
     print(f"hybrid.json deploy: {_HYBRID} confs={_hj.get('confs')} "
           f"hazard={_hj.get('hazard')}", flush=True)
 if _HYBRID:
@@ -254,6 +260,32 @@ if _HAZ:
     print(f"HAZARD trigger: {os.path.basename(_hpath)} @ thr "
           f"{os.environ.get('AIFARM_HAZARD_THR', '0.7')}", flush=True)
 print(f"backend: {type(dev).__name__} | dxcam: {getattr(dev,'_use_dx',None)} | model: {agent._device}", flush=True)
+
+# ---- M1.2 time-windowed gate schedule + post-fall caution (fall-forensics 2026-07-17) ----
+# Falls cluster in 150-165s and 225-315s (the gauntlet) and 72% of non-first falls land
+# within 8s of the previous one. During those windows the base model's JUMP gate is OPENED
+# (lowered) so pit-jumps it half-believes in actually fire; a post-fall window does the same
+# right after each detected fall (and can drop the hazard threshold too). Stateless per-frame
+# recompute in on_step; gates only ever open (min against the original), so the normal gate
+# returns by itself outside the windows. All OFF by default => deployed behaviour unchanged.
+_GATE_SCHED = []                    # [(lo_s, hi_s, gate)]
+for _seg in os.environ.get("AIFARM_GATE_SCHEDULE", "").split(","):
+    _seg = _seg.strip()
+    if _seg:
+        _rng, _g = _seg.split(":")
+        _lo, _hi = _rng.split("-")
+        _GATE_SCHED.append((float(_lo), float(_hi), float(_g)))
+_POSTFALL_S = float(os.environ.get("AIFARM_POSTFALL_S", "0"))
+_POSTFALL_GATE = float(os.environ.get("AIFARM_POSTFALL_GATE", "0.35"))
+_POSTFALL_HAZTHR = os.environ.get("AIFARM_POSTFALL_HAZTHR")   # e.g. "0.6"; unset = leave thr
+_gate_agent = getattr(agent, "inner", agent)          # HazardTrigger -> wrapped agent
+_gate_agent = getattr(_gate_agent, "base", _gate_agent)   # HybridPhaseAgent -> base model
+_BASE_GATE0 = getattr(_gate_agent, "_conf", None)
+_HAZ_THR0 = getattr(agent, "_thr", None)              # set only when HazardTrigger is outermost
+if _GATE_SCHED or _POSTFALL_S > 0:
+    print(f"GATE SCHEDULE: windows={_GATE_SCHED or '-'} postfall={_POSTFALL_S}s"
+          f"@{_POSTFALL_GATE}{' hazthr->' + _POSTFALL_HAZTHR if _POSTFALL_HAZTHR else ''} "
+          f"(base gate {_BASE_GATE0})", flush=True)
 
 diag = open(os.path.join(OUT, "hits.jsonl"), "a")
 totals = {"coins": 0, "runs": 0}
@@ -344,6 +376,21 @@ for run_no in range(1, MAX_RUNS + 1):
             last_pit[0] = now
             pit_times.append(now)
             print(f"PIT FALL #{pits[0]} @ {now:.0f}s", flush=True)
+        # M1.2: recompute the base jump gate for THIS frame (schedule windows + post-fall).
+        # min() against the original => gates only open; outside every window the original
+        # gate is restored implicitly. `now` is run-relative seconds, same clock as the
+        # forensics histogram the windows came from.
+        if _BASE_GATE0 is not None and (_GATE_SCHED or _POSTFALL_S > 0):
+            _g = _BASE_GATE0
+            for _lo, _hi, _gs in _GATE_SCHED:
+                if _lo <= now < _hi:
+                    _g = min(_g, _gs)
+            _pf = _POSTFALL_S > 0 and (now - last_pit[0]) <= _POSTFALL_S
+            if _pf:
+                _g = min(_g, _POSTFALL_GATE)
+            _gate_agent._conf = _g
+            if _HAZ_THR0 is not None and _POSTFALL_HAZTHR:
+                agent._thr = float(_POSTFALL_HAZTHR) if _pf else _HAZ_THR0
         hp = hp_frac(f)
         hp_hist.append((now, hp))
         while hp_hist and now - hp_hist[0][0] > 1.1: hp_hist.pop(0)
@@ -408,12 +455,20 @@ for run_no in range(1, MAX_RUNS + 1):
             written_frames = list(vrec["writer"].frames)
             complete = (play_completed and closed and vrec["writer"].error is None
                         and bool(written_frames))
-            with open(os.path.join(vrec["dir"], "frames.json"), "w") as fh:
-                json.dump({"frames": written_frames, "save_w": 640, "duration_s": recorded_dur,
-                           "actual_fps": round(len(written_frames) / max(recorded_dur, 0.1), 1),
-                           "pit_times": pit_times, "complete": complete}, fh)
-            with open(os.path.join(vrec["dir"], "keys.json"), "w") as fh:
-                json.dump(vrec["keys"], fh)
+            # Atomic writes: a force-kill (monitor._kill_stray_farm / Ctrl+C) mid-json.dump
+            # would otherwise leave a truncated frames.json that JSONDecode-crashes the next
+            # training-corpus load. Write to a .tmp then os.replace (atomic on same volume);
+            # a crash leaves the ignored .tmp and no half-written manifest.
+            _frames_manifest = {"frames": written_frames, "save_w": 640,
+                                "duration_s": recorded_dur,
+                                "actual_fps": round(len(written_frames) / max(recorded_dur, 0.1), 1),
+                                "pit_times": pit_times, "complete": complete}
+            for _path, _obj in ((os.path.join(vrec["dir"], "frames.json"), _frames_manifest),
+                                (os.path.join(vrec["dir"], "keys.json"), vrec["keys"])):
+                _tmp = _path + ".tmp"
+                with open(_tmp, "w") as fh:
+                    json.dump(_obj, fh)
+                os.replace(_tmp, _path)
             if not complete:
                 print(f"!! recording incomplete: {vrec['writer'].error or 'run/writer incomplete'}",
                       flush=True)

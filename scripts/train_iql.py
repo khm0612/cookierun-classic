@@ -88,6 +88,15 @@ _HUMAN = ("hf2", "hf3", "hf4")
 #                   A=0.0 (default) => the term is skipped => Q-loss is bit-identical.
 NSTEP = max(int(_farg("--nstep", 1)), 1)
 CQL_ALPHA = float(_farg("--cql-alpha", 0.0))
+# --- memory budget (2026-07-17) ---------------------------------------------------------------
+#   --max-frames N : cap the corpus to ~N frames. The frame bank is n*H*W uint8, and at the
+#                    deployed K=10/96x224 geometry that is ~21.5KB PER TRANSITION — so the full
+#                    1.43M-transition corpus is a ~30.6GB bank: bigger than this box's 16GB VRAM
+#                    AND its 31GB RAM (iql5b thrashed the pagefile, then OOM'd the GPU load and
+#                    died without saving). The cap keeps ALL human demos (the valuable prior)
+#                    plus the FRESHEST bot runs, and LOGS every run it drops — a silent cap would
+#                    read as "trained on everything". 0 (default) = no cap (original behaviour).
+MAX_FRAMES = int(_farg("--max-frames", 0))
 torch.manual_seed(0)
 
 meta = json.load(open(os.path.join(BASE, "demo", "model_meta.json")))
@@ -103,6 +112,29 @@ else:
                       if os.path.exists(os.path.join(d, "frames.json")))
     run_dirs += [os.path.join(BASE, r) for r in ("hf2", "hf3", "hf4")
                  if os.path.exists(os.path.join(BASE, r, "frames.json"))]
+
+if MAX_FRAMES > 0:
+    def _nframes(d):
+        try:
+            return len(json.load(open(os.path.join(d, "frames.json")))["frames"])
+        except Exception:
+            return 0
+    _humans = [d for d in run_dirs if os.path.basename(d) in _HUMAN]
+    _bots = [d for d in run_dirs if os.path.basename(d) not in _HUMAN]
+    _kept, _total = list(_humans), sum(_nframes(d) for d in _humans)
+    _dropped = []
+    for _d in sorted(_bots, key=os.path.getmtime, reverse=True):   # freshest bot runs first
+        _c = _nframes(_d)
+        if _total + _c <= MAX_FRAMES:
+            _kept.append(_d); _total += _c
+        else:
+            _dropped.append(_d)
+    if _dropped:
+        print(f"[budget] --max-frames {MAX_FRAMES}: keeping {len(_kept)} runs "
+              f"({_total} frames, ~{_total * H * W / 1e9:.1f}GB bank); DROPPED "
+              f"{len(_dropped)} oldest bot run(s): "
+              f"{', '.join(os.path.basename(d) for d in _dropped)}", flush=True)
+    run_dirs = sorted(_kept)
 print(f"IQL corpus: {[os.path.basename(r) for r in run_dirs]}", flush=True)
 
 
@@ -202,9 +234,13 @@ for rdir in run_dirs:
     _ctag = "-".join(f"{v:g}" for v in CROP)
     cache = os.path.join(rdir, f"cache_ssl_{H}x{W}_{_ctag}.npy")
     if os.path.exists(cache) and len(np.load(cache, mmap_mode="r")) == n:
-        imgs = np.load(cache)
+        # READ-ONLY MMAP (2026-07-17): loading every run's cache fully into RAM made the later
+        # np.concatenate need BOTH the per-run copies and the destination (~2x the bank = ~61GB
+        # on the 1.43M corpus) — it thrashed the pagefile on this 31GB box. The concatenate can
+        # copy straight out of the mmap, so peak RAM becomes just the destination bank.
+        imgs = np.load(cache, mmap_mode="r")
     else:
-        imgs = np.zeros((n, H, W), np.uint8)
+        imgs = np.zeros((n, H, W), np.uint8)     # cache miss: must be writable to build it
         fdir = os.path.join(rdir, "frames")
         for i, fr in enumerate(frames):
             im = cv2.imread(os.path.join(fdir, f"{fr['idx']:06d}.jpg"), cv2.IMREAD_GRAYSCALE)
@@ -270,7 +306,23 @@ print(f"total {n} transitions | terminals {int(is_term.sum())}", flush=True)
 if not torch.cuda.is_available():
     raise SystemExit("CUDA required")
 dev = torch.device("cuda")
-bank = torch.from_numpy(imgs).to(dev)
+# BANK MEMORY (OOM fix 2026-07-17): the frame bank is n*H*W uint8 — once the corpus grew past
+# ~1.4M transitions that is tens of GB, and pushing it all to VRAM silently OOM-killed the run
+# right after the corpus-load print (iql5b died here; iql5c's --min-quality corpus still fit).
+# Auto-pick: keep the bank in VRAM while it comfortably fits (fast path, unchanged), else keep
+# it in CPU RAM and move only the gathered per-batch stacks (B*K*H*W = a few MB) to the GPU.
+_bank_bytes = int(imgs.nbytes)
+try:
+    _free_vram = int(torch.cuda.mem_get_info()[0])
+except Exception:                                   # probe unavailable -> assume it won't fit
+    _free_vram = 0                                  # (CPU streaming is the safe fallback)
+BANK_ON_GPU = _bank_bytes < 0.5 * _free_vram        # headroom for nets, activations, batches
+bank = torch.from_numpy(imgs)
+if BANK_ON_GPU:
+    bank = bank.to(dev)
+else:
+    print(f"[mem] frame bank {_bank_bytes / 1e9:.1f}GB vs {_free_vram / 1e9:.1f}GB free VRAM "
+          f"-> streaming batches from CPU RAM", flush=True)
 del imgs
 ks = torch.arange(K - 1, -1, -1, dtype=torch.long, device=dev)
 idx_all = torch.arange(n, dtype=torch.long, device=dev)
@@ -284,7 +336,10 @@ actor_w_g = torch.from_numpy(actor_w).to(dev)   # M2 policy-loss weight (all 1.0
 def stacks(i):
     """(B,K,H,W) float stacks for frame indices i, clamped at run starts."""
     idx = torch.maximum(i[:, None] - ks[None, :], start_g[i][:, None])
-    return bank[idx].float().div_(255.0)
+    if BANK_ON_GPU:
+        return bank[idx].float().div_(255.0)
+    # bank lives in CPU RAM (corpus too big for VRAM): gather there, then move just this batch
+    return bank[idx.cpu()].to(dev, non_blocking=True).float().div_(255.0)
 
 
 class Net(nn.Module):

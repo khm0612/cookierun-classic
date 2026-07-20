@@ -2,6 +2,11 @@
 
 Local CookieRun Classic farming controller for an Android emulator.
 
+> **Full project reference:** [docs/PROJECT.md](docs/PROJECT.md) — architecture, all
+> subsystems, model lineage with measured results, the operations/failure catalog, and the
+> complete env-var + config reference. Commands live in [RUNBOOK.md](RUNBOOK.md); the
+> improvement roadmap in [docs/MILESTONES.md](docs/MILESTONES.md).
+
 ## Expected Local Setup
 
 - A blank ADB serial auto-selects the first ready emulator. An explicit serial fails closed

@@ -618,6 +618,26 @@ def test(path: str) -> None:
         log(f"would tap: {_CARD_CENTERS[i]} then {_CARD_CENTERS[j]}")
 
 
+def _hold_display_awake() -> None:
+    """Keep the Windows display awake for the whole batch. When the display sleeps, dxcam/DXGI
+    yields no frames, every run goes BLIND, and the supervisor hard-faults after two zero-run
+    attempts. run_all.py holds this for its own launch path; the standalone `monitor.py supervise`
+    entry point (documented in this module's header) needs the same, or an unattended batch dies
+    at the display-idle timeout. Daemon thread re-asserts every 30s and dies with the process."""
+    import ctypes
+    ES = 0x80000000 | 0x00000001 | 0x00000002   # CONTINUOUS | SYSTEM | DISPLAY
+
+    def loop():
+        while True:
+            try:
+                ctypes.windll.kernel32.SetThreadExecutionState(ES)
+            except Exception:
+                return                           # non-Windows / no kernel32: nothing to hold
+            time.sleep(30)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def main(supervise_target: "int | None" = None) -> int:
     matcher = TemplateMatcher(TEMPLATES)
     if not matcher.has("cardgame"):
@@ -625,6 +645,7 @@ def main(supervise_target: "int | None" = None) -> int:
         sys.exit(1)
     if supervise_target:
         _STOP.clear()
+        _hold_display_awake()                    # standalone batch owner: keep dxcam fed
         _sup.update(target=supervise_target, done=0, finished=False, proc=None)
         log(f"monitor: SUPERVISING {supervise_target} runs + card/adb watch | serial={SERIAL}")
         threading.Thread(target=_pump_supervisor, args=(supervise_target,),
@@ -667,6 +688,31 @@ def main(supervise_target: "int | None" = None) -> int:
                 elif matcher.present(f, "league_results", 0.85):
                     _dismiss_modal_safely(matcher, "league_results", (1280, 1210),
                                           "LEAGUE RESULTS")
+                    seen = 0
+                    hb = time.monotonic()
+                elif matcher.present(f, "mysterybox", 0.85):
+                    # Post-run Mystery Box reward (coins) — a benign, spend-free popup whose
+                    # generic teal "Confirm" nav deliberately won't tap (is_allowed("confirm")
+                    # is False by design, so a purchase-confirm is never auto-tapped). BANNER-
+                    # GATED on the distinctive "Mystery Box" scroll (spend-free), so tapping its
+                    # Confirm here is safe. Without this nav BACK-spams it into a wedge (~1/run).
+                    _dismiss_modal_safely(matcher, "mysterybox", (1285, 1247), "MYSTERY BOX")
+                    seen = 0
+                    hb = time.monotonic()
+                elif matcher.present(f, "levelup", 0.85):
+                    # Level-Up reward popup (crystals+coins+score bonus) — same class as the
+                    # Mystery Box: a benign, spend-free reward with a green Confirm that nav's
+                    # confirm-guardrail won't tap. Banner-gated on the "Level Up" title so it can
+                    # only fire on the real reward. Rare (fires on level-up); nav BACK-wedges it.
+                    _dismiss_modal_safely(matcher, "levelup", (1267, 1235), "LEVEL UP")
+                    seen = 0
+                    hb = time.monotonic()
+                elif matcher.present(f, "congrats", 0.85):
+                    # "Congratulations!" challenge-complete rewards (Coin Challenge boosts etc.)
+                    # — third member of the benign reward-popup class, and they QUEUE (3 seen
+                    # back-to-back live 2026-07-17). dismiss_modal's 4-tap loop drains a queue;
+                    # anything longer is re-detected on the next poll, so it self-heals.
+                    _dismiss_modal_safely(matcher, "congrats", (1280, 1143), "CONGRATS REWARD")
                     seen = 0
                     hb = time.monotonic()
                 else:

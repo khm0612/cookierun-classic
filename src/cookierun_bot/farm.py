@@ -164,21 +164,18 @@ def ensure_running(dev, matcher, cfg=None, tries: int = 240, log=print,
                     _sleep_interruptible(0.5, should_stop)
                     continue
                 cycle["required_boost_cost"] = required_boosts.spent
-                # The ready gate above handles an already-active banner. Once a bounded
-                # purchase attempt fails, do not retry it within this navigation cycle.
+                # USER DIRECTIVE (2026-07-17): always TRY to activate Double Coins, but a
+                # failed/unavailable doubler must never stall farming — one bounded attempt
+                # per navigation cycle, then Play regardless. (The old wait-for-banner loop
+                # deadlocked the farm whenever the game withheld the offer.)
                 if cycle.get("double_coin_failed") and not matcher.present(f, "dblbanner", 0.80):
-                    log("[boost] Double Coins was already attempted and not verified; not retrying")
-                    _sleep_interruptible(0.5, should_stop)
-                    continue
-                result = buy_double_coins(
-                    dev, matcher, spending, log=log, should_stop=should_stop)
-                cycle["double_coin_cost"] += result.spent
-                if not result.active:
-                    cycle["double_coin_failed"] = True
-                    log("[boost] Double Coins banner not verified; not pressing Play")
-                    _sleep_interruptible(0.5, should_stop)
-                    continue
-                cycle["double_coin_failed"] = False
+                    log("[boost] Double Coins was already attempted and not verified; "
+                        "playing without it")
+                else:
+                    result = buy_double_coins(
+                        dev, matcher, spending, log=log, should_stop=should_stop)
+                    cycle["double_coin_cost"] += result.spent
+                    cycle["double_coin_failed"] = not result.active
                 cycle["boost_cost"] = cycle["required_boost_cost"] + cycle["double_coin_cost"]
             if menu_nav is not None and not menu_nav.is_allowed("play"):
                 log("[nav] play is not in menu allowlist")

@@ -789,9 +789,12 @@ class LDPlayerDevice:
     def last_frame(self):
         if self._stopped:
             return None
-        if self._adb_only:
-            return self._adb.last_frame()
         import cv2
+        if self._adb_only:
+            raw = self._adb.last_frame()         # canonicalize to _PRESENT like every other path:
+            if raw is None or raw.size == 0:     # the resolution property reports 2560x1440, and
+                return None                      # abs-pixel consumers (hp_frac, HUD templates) rely
+            return cv2.resize(raw, self._PRESENT, interpolation=cv2.INTER_LINEAR)  # on that space
         raw = self._grab_dx() if self._use_dx else None
         if raw is None and self._use_dx and self._present_cache is not None:
             return self._present_cache         # dxcam: None == unchanged -> serve cached present

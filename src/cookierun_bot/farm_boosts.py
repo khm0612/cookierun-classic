@@ -7,8 +7,8 @@ import numpy as np
 
 from .detect import read_int
 from .farm_common import (
-    _boost_read_fast, _stop_requested, _wait_for_change, _find_stable, _tile_checked,
-    _tile_checked_stable,
+    _boost_read_fast, _sleep_interruptible, _stop_requested, _wait_for_change, _find_stable,
+    _tile_checked, _tile_checked_stable,
     BoostResult, BoostTileStatus, BoostGateStatus,
 )
 
@@ -176,12 +176,62 @@ def ensure_run_boosts(dev, matcher, spending, log=print, should_stop=None) -> Bo
 
 def buy_double_coins(dev, matcher, spending, log=print,
                      should_stop=None) -> BoostResult:
-    """Refuse Multi-Buy because one tap authorizes an unbounded number of in-game rerolls.
+    """Activate the Double Coins doubler via the Random-Boost Multi-Buy (USER DIRECTIVE
+    2026-07-17: "always activate the coin booster ... no rerolls cap").
 
-    A finite ``max_boost_cost_per_run`` cannot be enforced after that tap, and the screen's
-    coin OCR is not reliable enough to stop it. An already-active banner is handled by the
-    caller's read-only gate before this function is reached.
-    """
-    if spending.allow_coin_boosts:
-        log("[boost] Multi-Buy has no enforceable spend cap; skipping")
-    return BoostResult(False, 0)
+    Live-mapped flow (2026-07-18, every step template-gated so a missing screen just skips):
+      chesttile (the pink ? Random-Boost tile, ~1,200c) selects the Random Boost PANEL ->
+      multibtn (pink "Multi" pill on that panel) opens the "Pick desired Boosts!" dialog ->
+      the Double Coins row persists CHECKED (dblcheck; re-check via dblrow if not) ->
+      multibuy starts the game's own roll loop, which SPENDS coins (first 1,200 / reroll 600)
+      and STOPS ITSELF the moment a selected boost lands -> the dialog closes and the red
+      dblbanner shows above Play. Rolls that land other boosts are owned boosts, not waste.
+
+    The old refusal ("no enforceable spend cap") is superseded by the user directive: the
+    game's own stop-at-success bounds the spend in practice (~9k coins observed vs ~45k
+    earned/run pre-doubling). A 75s watchdog stops WAITING (never the game) so a hung
+    dialog cannot stall farming; the caller plays without the doubler on any failure."""
+    if not spending.allow_coin_boosts:
+        return BoostResult(False, 0)
+    est = int(getattr(spending, "double_coins_first_cost", 1200))
+    ff = _boost_read_fast(dev)
+    if ff is not None and matcher.present(ff, "dblbanner", 0.80):
+        log("[boost] Double Coins banner already active")
+        return BoostResult(True, 0)
+    pt, _f = _find_stable(dev, matcher, "chesttile", 0.80, should_stop=should_stop)
+    if pt is None:
+        log("[boost] Random-Boost tile not visible; playing without Double Coins")
+        return BoostResult(False, 0)
+    dev.tap(*pt)
+    pt, _f = _find_stable(dev, matcher, "multibtn", 0.80, should_stop=should_stop)
+    if pt is None:
+        log("[boost] Multi pill not visible; playing without Double Coins")
+        return BoostResult(False, 0)
+    dev.tap(*pt)
+    pt, f = _find_stable(dev, matcher, "pickboosts", 0.80, should_stop=should_stop)
+    if pt is None or f is None:
+        log("[boost] Pick-Boosts dialog did not open; playing without Double Coins")
+        return BoostResult(False, 0)
+    if not matcher.present(f, "dblcheck", 0.80):
+        row = matcher.find(f, "dblrow", 0.80)
+        if row is None:
+            log("[boost] Double Coins row not found in dialog; playing without it")
+            return BoostResult(False, 0)
+        dev.tap(*row)                        # one tap checks the row (selection persists)
+        _sleep_interruptible(0.5, should_stop)
+    pt, _f = _find_stable(dev, matcher, "multibuy", 0.80, should_stop=should_stop)
+    if pt is None:
+        log("[boost] Multi-Buy button not found; playing without Double Coins")
+        return BoostResult(False, 0)
+    dev.tap(*pt)
+    log("[boost] Multi-Buy pressed — game rolls until Double Coins lands "
+        "(self-stopping; no reroll cap per user directive)")
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 75.0 and not _stop_requested(should_stop):
+        fr = _boost_read_fast(dev)
+        if fr is not None and matcher.present(fr, "dblbanner", 0.80):
+            log(f"[boost] Double Coins ACTIVE ({time.monotonic() - t0:.0f}s)")
+            return BoostResult(True, est)
+        _sleep_interruptible(1.0, should_stop)
+    log("[boost] Double Coins banner not seen within 75s — playing without it")
+    return BoostResult(False, est)

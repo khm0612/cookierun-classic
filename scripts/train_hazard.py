@@ -75,7 +75,9 @@ def load_run(rdir):
     # label = 1 for frames within HAZARD_S BEFORE a pit-lift prompt (the approach window)
     y = np.zeros(len(frames), np.float32)
     for p in pits:
-        lo = np.searchsorted(ts, ts[p] - HAZARD_S)
+        if p < 0 or p >= len(ts):        # a stale cache_pits.npy (not regenerated when the
+            continue                     # recording shrank) can hold out-of-range indices;
+        lo = np.searchsorted(ts, ts[p] - HAZARD_S)   # ts[p] would IndexError and kill the run
         y[lo:p + 1] = 1.0
     return imgs, y, ts, pits
 

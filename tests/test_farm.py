@@ -4,6 +4,7 @@ import numpy as np
 
 from cookierun_bot.config import SpendingConfig
 from cookierun_bot import farm
+from cookierun_bot import farm_boosts
 from cookierun_bot import farm_common
 from cookierun_bot.gift_draw import GiftDrawResult
 
@@ -567,11 +568,16 @@ def test_auto_serial_config_keeps_ambiguous_missing_device(monkeypatch):
     assert cfg.device_serial == "missing"
 
 
-def test_buy_double_coins_never_taps_unbounded_multi_buy(monkeypatch):
+def test_buy_double_coins_skips_cleanly_when_flow_screens_missing(monkeypatch):
+    # USER DIRECTIVE 2026-07-17: the buy is IMPLEMENTED (chesttile -> multi -> multibuy),
+    # but when the Random-Boost tile never appears the attempt must skip with NO taps so
+    # the caller can Play without the doubler (never stall farming).
     monkeypatch.setattr(farm, "_sleep_interruptible", lambda *a, **k: None)
-    dialog = np.full((4, 4, 3), 1, np.uint8)
-    banner = np.full((4, 4, 3), 2, np.uint8)
-    dev = FakeDevice([dialog, banner])
+    monkeypatch.setattr(farm_boosts, "_find_stable",
+                        lambda *a, **k: (None, np.zeros((4, 4, 3), np.uint8)))
+    monkeypatch.setattr(farm_boosts, "_boost_read_fast",
+                        lambda dev: np.zeros((4, 4, 3), np.uint8))
+    dev = FakeDevice([np.zeros((4, 4, 3), np.uint8)])
     dev.taps = []
     dev.tap = lambda x, y: dev.taps.append((x, y))
 
@@ -580,7 +586,7 @@ def test_buy_double_coins_never_taps_unbounded_multi_buy(monkeypatch):
         BoostMatcher(),
         SpendingConfig(
             allow_coin_boosts=True,
-            max_boost_cost_per_run=1200,
+            max_boost_cost_per_run=12000,
             max_double_coin_rolls=2,
         ),
         log=lambda _: None,
@@ -590,10 +596,9 @@ def test_buy_double_coins_never_taps_unbounded_multi_buy(monkeypatch):
     assert dev.taps == []
 
 
-def test_buy_double_coins_does_not_tap_when_budget_too_low(monkeypatch):
+def test_buy_double_coins_disabled_when_coin_boosts_off(monkeypatch):
     monkeypatch.setattr(farm, "_sleep_interruptible", lambda *a, **k: None)
-    dialog = np.full((4, 4, 3), 1, np.uint8)
-    dev = FakeDevice([dialog])
+    dev = FakeDevice([np.zeros((4, 4, 3), np.uint8)])
     dev.taps = []
     dev.tap = lambda x, y: dev.taps.append((x, y))
 
@@ -601,7 +606,7 @@ def test_buy_double_coins_does_not_tap_when_budget_too_low(monkeypatch):
         dev,
         BoostMatcher(),
         SpendingConfig(
-            allow_coin_boosts=True,
+            allow_coin_boosts=False,
             max_boost_cost_per_run=500,
             max_double_coin_rolls=1,
         ),
@@ -613,11 +618,14 @@ def test_buy_double_coins_does_not_tap_when_budget_too_low(monkeypatch):
     assert dev.taps == []
 
 
-def test_ensure_running_does_not_play_without_double_coin_banner(monkeypatch):
+def test_ensure_running_plays_even_when_double_coin_buy_fails(monkeypatch):
+    # USER DIRECTIVE 2026-07-17: a failed Double Coins buy must NOT stall farming — the
+    # attempt is made, the failure is booked, and Play is still pressed.
     monkeypatch.setattr(farm, "_sleep_interruptible", lambda *a, **k: None)
     monkeypatch.setattr(farm, "_wait_for_change", lambda *a, **k: None)
     monkeypatch.setattr(farm, "ensure_run_boosts", lambda *a, **k: farm.BoostResult(True, 1600))
     monkeypatch.setattr(farm, "buy_double_coins", lambda *a, **k: farm.BoostResult(False, 1200))
+    monkeypatch.setattr(farm, "_watch_headstart", lambda *a, **k: False)
     play_taps = []
     monkeypatch.setattr(
         farm,
@@ -628,21 +636,19 @@ def test_ensure_running_does_not_play_without_double_coin_banner(monkeypatch):
     logs = []
     cycle = {}
 
-    assert farm.ensure_running(
+    farm.ensure_running(
         dev,
         RequiredBoostMatcher(active=False),
         cfg=type("Cfg", (), {"spending": _SPEND})(),
         tries=2,
         log=logs.append,
         cycle=cycle,
-    ) is False
+    )
 
-    assert "play" not in play_taps
+    assert "play" in play_taps
     assert logs[0].startswith("[boost] ready=False required=True double_banner=False")
-    assert logs[1] == "[boost] Double Coins banner not verified; not pressing Play"
     assert cycle["required_boost_cost"] == 1600
     assert cycle["double_coin_cost"] == 1200
-    assert cycle["boost_cost"] == 0
     assert cycle["double_coin_failed"] is True
 
 
@@ -677,10 +683,13 @@ def test_ensure_running_does_not_play_without_required_three_boosts(monkeypatch)
     assert cycle["double_coin_cost"] == 0
 
 
-def test_ensure_running_does_not_retry_double_coin_after_failed_verification(monkeypatch):
+def test_ensure_running_attempts_double_coin_once_per_cycle_then_plays(monkeypatch):
+    # One bounded buy attempt per navigation cycle: the retry visit logs and PLAYS
+    # instead of re-buying or stalling (directive: farming never waits on the doubler).
     monkeypatch.setattr(farm, "_sleep_interruptible", lambda *a, **k: None)
     monkeypatch.setattr(farm, "_wait_for_change", lambda *a, **k: None)
     monkeypatch.setattr(farm, "ensure_run_boosts", lambda *a, **k: farm.BoostResult(True, 1600))
+    monkeypatch.setattr(farm, "_watch_headstart", lambda *a, **k: False)
     calls = []
 
     def fail_double(*args, **kwargs):
@@ -689,22 +698,22 @@ def test_ensure_running_does_not_retry_double_coin_after_failed_verification(mon
 
     monkeypatch.setattr(farm, "buy_double_coins", fail_double)
     monkeypatch.setattr(farm, "_tap_template", lambda *a, **k: True)
-    dev = FakeDevice([np.zeros((4, 4, 3), np.uint8)])
+    dev = FakeDevice([np.zeros((400, 500, 3), np.uint8)])
     logs = []
-    cycle = {}
+    cycle = {"double_coin_failed": True}     # a prior attempt this cycle already failed
 
-    assert farm.ensure_running(
+    farm.ensure_running(
         dev,
         RequiredBoostMatcher(active=False),
         cfg=type("Cfg", (), {"spending": _SPEND})(),
-        tries=4,
+        tries=2,
         log=logs.append,
         cycle=cycle,
-    ) is False
+    )
 
-    assert len(calls) == 1
-    assert cycle["boost_cost"] == 0
-    assert logs[-1] == "[boost] Double Coins was already attempted and not verified; not retrying"
+    assert calls == []                       # no re-buy on the retry visit
+    assert any(l == "[boost] Double Coins was already attempted and not verified; "
+                    "playing without it" for l in logs)
 
 
 def test_ensure_running_books_boost_cost_only_when_play_gate_ready(monkeypatch):
