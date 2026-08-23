@@ -224,6 +224,13 @@ if not _HYBRID and os.path.exists(_HYB_FILE):
         os.environ.setdefault("AIFARM_HAZARD", str(_hj["hazard"]))
         if _hj.get("hazard_thr") is not None:
             os.environ.setdefault("AIFARM_HAZARD_THR", str(_hj["hazard_thr"]))
+        # Sensitivity knobs are durable too, so a tuned detector deploys as one unit:
+        # maxjump = chained taps per pit episode (wide pits need 2), every = check cadence
+        # in frames (lower = more looks/s). Absent keys leave the code defaults untouched.
+        if _hj.get("hazard_maxjump") is not None:
+            os.environ.setdefault("AIFARM_HAZARD_MAXJUMP", str(_hj["hazard_maxjump"]))
+        if _hj.get("hazard_every") is not None:
+            os.environ.setdefault("AIFARM_HAZARD_EVERY", str(_hj["hazard_every"]))
     # DURABLE M1.2 deploy: {"gate_schedule":"150-165:0.35,225-315:0.35","postfall_s":8}
     # in hybrid.json arms the fall-forensics gate windows + post-fall caution below.
     if _hj.get("gate_schedule"):

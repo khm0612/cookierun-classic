@@ -99,6 +99,7 @@ _sup = {"target": 0, "done": 0, "finished": False, "proc": None}
 _STOP = threading.Event()   # set on monitor shutdown so the pump won't relaunch mid-exit
 _REFRESH_PENDING = threading.Event()
 _CARD_SOLVER_LOCK = threading.Lock()
+_CARD_UNBLOCKS = 0          # unattended low-confidence unblocks this session (escalation)
 _SUP_LAUNCH_LOCK = threading.Lock()
 
 
@@ -201,11 +202,83 @@ def save_card(frame, rnd) -> None:
         pass
 
 
-def _wait_for_manual_card_clear(matcher: TemplateMatcher) -> None:
-    """Hold the farm on a low-confidence card board until the user clears it."""
+def _jumping_card_pick(shots: int = 14, dt: float = 0.30):
+    """Read the "Surprise! Find the jumping card!" board by TEMPORAL frame-diff.
+
+    Pair-similarity (`_card_pair`) cannot see this variant at all — it scores ~0.0-0.5,
+    always under MARGIN_OK — so the solver stood down every time and the game just served
+    another board (live 2026-08-23: 13 consecutive unblocks, ~1.5h of the night lost).
+    The six cards animate in exactly TWO synced groups and the MINORITY group of 2 is the
+    answer. The separation is huge and unambiguous (measured 0.93 vs 3.39, and 3.00 vs
+    11.26), so a largest-gap split over per-card peak |Δgray| is enough. Nothing visibly
+    "jumps" — do not look for motion; look for which cards share an animation phase.
+
+    Returns (i, j) 0-based card indices, or None when the split is not clean (caller then
+    falls back to standing down, exactly as before).
+    """
+    frames = []
+    for _ in range(shots):
+        f = grab()
+        if f is not None:
+            frames.append(f)
+        time.sleep(dt)
+    if len(frames) < 6:
+        return None
+    peaks = []
+    for (cx, cy) in _CARD_CENTERS:
+        crops = [cv2.cvtColor(f[max(cy - 230, 0):cy + 230, max(cx - 190, 0):cx + 190],
+                              cv2.COLOR_BGR2GRAY).astype(np.float32) for f in frames]
+        diffs = [float(np.abs(crops[k] - crops[k - 1]).mean()) for k in range(1, len(crops))]
+        peaks.append(max(diffs) if diffs else 0.0)
+    order = sorted(range(len(peaks)), key=lambda i: peaks[i])
+    gap, at = max(((peaks[order[i + 1]] - peaks[order[i]], i) for i in range(len(order) - 1)),
+                  default=(0.0, -1))
+    low = order[:at + 1]
+    if len(low) != 2:                       # the answer group is always exactly 2 cards
+        return None
+    if peaks[order[at + 1]] < 1.5 * max(peaks[order[at]], 0.05):
+        return None                         # groups not cleanly separated -> don't gamble
+    return low[0], low[1]
+
+
+def _wait_for_manual_card_clear(matcher: TemplateMatcher, guess=None) -> None:
+    """Hold the farm on a low-confidence card board until the user clears it.
+
+    UNATTENDED FALLBACK — `AIFARM_CARD_WAIT_S` (default 0 = wait forever = the long-tested
+    attended behaviour). Overnight there is no human to clear the board and the economics
+    invert: forfeiting one card bonus costs a few thousand coins, while an hour of stalled
+    farming costs ~100k plus a whole improvement cycle. When the env is set we wait that
+    long for a human, then tap the heuristic best guess purely to unblock the farm. The
+    guess is the same pair the solver already computed; being wrong just ends the bonus.
+    """
+    # ESCALATION (live 2026-08-23 02:28-03:14): one low-confidence board cost 46 minutes.
+    # Each unblock cleared that board but the game immediately presented another, and every
+    # new board restarted the full wait — 10 min per cycle, unbounded. The "Surprise! Find
+    # the jumping card!" variant ALWAYS scores below MARGIN_OK (pair-similarity cannot read
+    # it), so it stands down every time and the loop never ends on its own. Give a human a
+    # real chance on the FIRST board only, then drop to a short wait so repeats cost ~1 min
+    # instead of ~10. Frame-diff minority detection would solve this variant properly.
+    global _CARD_UNBLOCKS
+    wait_s = float(os.environ.get("AIFARM_CARD_WAIT_S", "0") or 0)
+    if wait_s > 0 and _CARD_UNBLOCKS >= 1:
+        wait_s = min(wait_s, 60.0)
+    t0 = time.monotonic()
     last_ping = 0.0
     grab_fails = 0
     while True:
+        if wait_s > 0 and guess is not None and time.monotonic() - t0 > wait_s:
+            gi, gj = guess
+            _CARD_UNBLOCKS += 1
+            log(f"card wait {wait_s:.0f}s elapsed with no human -- unblocking with the "
+                f"heuristic guess (cards {gi + 1} & {gj + 1}); a wrong pair only forfeits "
+                f"this bonus (unblock #{_CARD_UNBLOCKS}; later boards wait only 60s)")
+            try:
+                tap(*_CARD_CENTERS[gi]); time.sleep(0.6); tap(*_CARD_CENTERS[gj])
+                time.sleep(4.0)
+            except Exception as exc:
+                log(f"card unblock tap failed: {exc!r}")
+            _clear_card_flag()
+            return
         if _sup["finished"] or _STOP.is_set() or _REFRESH_PENDING.is_set():
             _clear_card_flag()
             log("card wait cancelled -- supervision/refresh is finishing")
@@ -267,9 +340,24 @@ def _solve_cardgame(matcher: TemplateMatcher) -> None:
         save_card(f, rnd)
         i, j, margin = _card_pair(f)
         if margin < MARGIN_OK:
-            log(f"round {rnd}: margin {margin:.1f} < {MARGIN_OK} = low confidence -- STANDING DOWN "
-                f"(heuristic guess cards {i + 1} & {j + 1}); waiting for manual solve")
-            _wait_for_manual_card_clear(matcher)
+            # Before standing down, try the frame-diff reader: a low pair-similarity margin
+            # is the signature of the "jumping card" variant, which that heuristic simply
+            # cannot see. A wrong pick here costs exactly what the old fallback guess cost
+            # (the bonus), while standing down costs the whole night to a 10-min-per-board
+            # loop, so attempting a MEASURED pick is strictly better than waiting.
+            pick = _jumping_card_pick()
+            if pick is not None:
+                pi, pj = pick
+                log(f"round {rnd}: margin {margin:.1f} low, but frame-diff split is clean "
+                    f"-> tapping cards {pi + 1} & {pj + 1}")
+                tap(*_CARD_CENTERS[pi])
+                time.sleep(0.6)
+                tap(*_CARD_CENTERS[pj])
+                time.sleep(4.0)
+                continue
+            log(f"round {rnd}: margin {margin:.1f} < {MARGIN_OK} = low confidence and no clean "
+                f"frame-diff split -- STANDING DOWN (heuristic guess cards {i + 1} & {j + 1})")
+            _wait_for_manual_card_clear(matcher, guess=(i, j))
             return
         ci, cj = _CARD_CENTERS[i], _CARD_CENTERS[j]
         log(f"round {rnd}: pair = cards {i + 1} & {j + 1} (margin {margin:.1f} OK) "
@@ -705,6 +793,15 @@ def main(supervise_target: "int | None" = None) -> int:
                     # confirm-guardrail won't tap. Banner-gated on the "Level Up" title so it can
                     # only fire on the real reward. Rare (fires on level-up); nav BACK-wedges it.
                     _dismiss_modal_safely(matcher, "levelup", (1267, 1235), "LEVEL UP")
+                    seen = 0
+                    hb = time.monotonic()
+                elif matcher.present(f, "eventspanel", 0.85):
+                    # Full-screen Events panel (live 2026-08-23 05:07-05:29, 22 min lost): a
+                    # stray tap opens it, its X does not match the close/close2 templates, and
+                    # KEYCODE_BACK does not dismiss it — so nav logs "unrecognized settled
+                    # modal" forever. Banner-gated on the "Events" sidebar title (spend-free);
+                    # the X sits at a fixed spot on this panel.
+                    _dismiss_modal_safely(matcher, "eventspanel", (2272, 92), "EVENTS PANEL")
                     seen = 0
                     hb = time.monotonic()
                 elif matcher.present(f, "congrats", 0.85):
