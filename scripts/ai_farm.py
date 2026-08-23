@@ -340,6 +340,7 @@ for run_no in range(1, MAX_RUNS + 1):
     pits = [0]                    # PIT FALLS this run (revive-tanked falls included — the
     last_pit = [-9.0]             # setup absorbs 3, so these never show in hp/terminals)
     pit_times = []
+    pit_phase = []                # "bonus" | "normal" per fall (see the PIT FALL log below)
     # REBOUND-CONFIRM: a real hit leaves hp PERSISTENTLY lower; an overlay sweeping the
     # HP strip (bonus washes, zone-title cards — background-dependent, so the banner
     # template alone can't catch them all: the bright-jungle zone dropped its score
@@ -382,7 +383,16 @@ for run_no in range(1, MAX_RUNS + 1):
             pits[0] += 1
             last_pit[0] = now
             pit_times.append(now)
-            print(f"PIT FALL #{pits[0]} @ {now:.0f}s", flush=True)
+            # WHERE do falls happen? The hazard trigger deliberately stands down during
+            # BONUSTIME (the film dodger owns those frames), so if falls cluster there no
+            # detector work can ever help. This cannot be measured from the recordings —
+            # their 640x360 JPEGs blur the banner below the match threshold — so tag it
+            # live off the same latch the hybrid uses. `last_bt` is set on every frame
+            # where the banner is seen; BONUS_LATCH_S(3s) is the hybrid's own hysteresis.
+            _in_bonus = (now - last_bt[0]) < 3.0
+            pit_phase.append("bonus" if _in_bonus else "normal")
+            print(f"PIT FALL #{pits[0]} @ {now:.0f}s "
+                  f"[{'BONUSTIME' if _in_bonus else 'normal-stage'}]", flush=True)
         # M1.2: recompute the base jump gate for THIS frame (schedule windows + post-fall).
         # min() against the original => gates only open; outside every window the original
         # gate is restored implicitly. `now` is run-relative seconds, same clock as the
@@ -469,7 +479,8 @@ for run_no in range(1, MAX_RUNS + 1):
             _frames_manifest = {"frames": written_frames, "save_w": 640,
                                 "duration_s": recorded_dur,
                                 "actual_fps": round(len(written_frames) / max(recorded_dur, 0.1), 1),
-                                "pit_times": pit_times, "complete": complete}
+                                "pit_times": pit_times, "pit_phase": pit_phase,
+                                "complete": complete}
             for _path, _obj in ((os.path.join(vrec["dir"], "frames.json"), _frames_manifest),
                                 (os.path.join(vrec["dir"], "keys.json"), vrec["keys"])):
                 _tmp = _path + ".tmp"
